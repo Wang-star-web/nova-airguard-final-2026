@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AirGuard 校园空气质量监测台（D1/D2/D3）</title>
+<!--
+=====================================================================
+ AirGuard Web 监测台 —— D1 多区域卡片 / D2 优先关注 / D3 事件状态机
+ 仅依赖公开 CDN 的 mqtt.js（主源 jsdelivr，备用 unpkg，均锁 @5 大版本），
+ CSS 全部手写，无任何本地私有库。
+
+ 【启动顺序】
+   1. 先启动本地 Mosquitto broker（MQTT-over-WebSocket）
+   2. 双击打开本页面（file:// 直连 ws:// 无混合内容问题）
+   3. 运行 mqtt_publish.py 发送模拟报文；持续演示: py mqtt_publish.py stream --all-zones
+
+ 【mosquitto.conf 最小配置】（保存为 mosquitto.conf 后执行 mosquitto -c mosquitto.conf -v）
+   allow_anonymous true          # 2.x 默认拒绝匿名，必须显式开启
+   listener 1883 127.0.0.1      # 普通 MQTT（TCP）
+   listener 8083 127.0.0.1      # MQTT over WebSocket（本页面连接端口）
+   protocol websockets          # 作用于上方最近的 listener(8083)
+   # 需局域网内其他设备访问时，把 127.0.0.1 改为 0.0.0.0（本机与局域网均可达）
+   # 建议使用 Mosquitto 2.1+（2.0.x 的 websocket listener 有已知缺陷）
+
+ 【约束自检清单】（实现位置见文内注释）
+   C1  三 zone 严格隔离            -> createZoneStates/newZoneState，所有状态按 zoneId 键控
+   C2  统一JSON报文校验             -> parseMsgPayload
+   C3  status 代码按顺序计算        -> computeStatus（忽略报文自带 status，禁止硬编码）
+   C4  D2 环境权重 4/3/2/1 打分     -> scorePriority（独立函数，无 zoneId 分支）
+   C5  crowdSource=model且confidence<0.6 需人工复核且不计分 -> scorePriority/needsReviewOf
+   C6  D3 规则1 异常新建事件OPEN    -> handleAbnormal -> createEvent
+   C7  D3 规则2 按钮 OPEN->HANDLING -> handleIntervention（不存在直接置 RECOVERED 的分支）
+   C8  D3 规则3 仅新MQTT数据可恢复  -> recoverEvent 仅被 handleNormal(HANDLING分支)调用
+   C9  D3 规则4 恶化回退OPEN        -> rollbackToOpen（严重度>=创建时严重度，等重也算恶化）
+   C10 D3 规则5 迟到旧消息仅追加历史 -> processOne/handleLate
+   C11 D3 规则6 去重+乱序排序      -> dedupHash/onMessageReceived/flushZone
+   C12 event 固定 8 字段          -> createEvent
+   C13 仅公开CDN、手写CSS          -> 本文件头部引用
+   C14 中文UI、逻辑层不碰DOM       -> 后端逻辑层纯函数，UI 层统一 render()
+=====================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+/* ==================== 设计变量（dataviz 参考调色板·暗色） ==================== */
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;            /* 页面底 */
+  --surface: #1a1a19;         /* 面板表面 */
+  --ink: #ffffff;             /* 主文字 */
+  --ink-2: #c3c2b7;           /* 次级文字 */
+  --ink-3: #898781;           /* 弱化文字/轴线 */
+  --border: rgba(255, 255, 255, 0.10);
+  --grid: #2c2c2a;
+  /* 类目色：三个 zone 的身份色（固定分配，禁止按排名换色） */
+  --series-1: #3987e5;        /* zone-n 宿舍区 */
+  --series-2: #d95926;        /* zone-s 教学区 */
+  --series-3: #199e70;        /* zone-w 食堂区 */
+  /* 状态色：保留语义，永远 icon+label 成对出现 */
+  --st-good: #0ca30c;
+  --st-warning: #fab219;
+  --st-serious: #ec835a;
+  --st-critical: #d03b3b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 24px 48px; }
+
+/* ==================== 头部 ==================== */
+header {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+  padding-bottom: 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+h1 { font-size: 20px; margin: 0; }
+.subtitle { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
+#conn-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--ink-2); padding: 6px 12px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
+}
+#conn-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+#conn-badge.connected .dot { background: var(--st-good); }
+#conn-badge.reconnecting .dot { background: var(--st-warning); }
+#conn-badge.disconnected .dot { background: var(--st-critical); }
+
+/* ==================== 面板通用 ==================== */
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px; margin-top: 16px;
+}
+.panel h2 {
+  font-size: 13px; font-weight: 600; color: var(--ink-2);
+  margin: 0 0 12px; letter-spacing: 1px;
+}
+.panel-empty { color: var(--ink-3); text-align: center; padding: 18px 0; font-size: 13px; }
+
+/* ==================== zone 身份芯片 / 状态徽章 ==================== */
+.zone-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid;
+  white-space: nowrap;
+}
+.zc-zone-n { color: var(--series-1); border-color: var(--series-1); }
+.zc-zone-s { color: var(--series-2); border-color: var(--series-2); }
+.zc-zone-w { color: var(--series-3); border-color: var(--series-3); }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid currentColor; background: rgba(255, 255, 255, 0.04);
+  white-space: nowrap;
+}
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+/* 状态徽章：圆点(icon) + 文字(label) 成对，颜色不单独承载语义 */
+.st-good     { color: var(--st-good); }
+.st-warning  { color: var(--st-warning); }
+.st-serious  { color: var(--st-serious); }
+.st-critical { color: var(--st-critical); }
+
+/* ==================== D1 多区域卡片 ==================== */
+#d1-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+.zone-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
+.stat-label { font-size: 11px; color: var(--ink-3); }
+.stat-value { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card-foot { margin-top: 12px; font-size: 11px; color: var(--ink-3); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card-empty { color: var(--ink-3); padding: 26px 0; text-align: center; font-size: 13px; }
+
+/* ==================== D2 优先关注面板 ==================== */
+.d2-row { display: flex; gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.d2-row:last-child { border-bottom: none; }
+.d2-rank { width: 42px; font-size: 20px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.d2-main { flex: 1; min-width: 0; }
+.d2-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.d2-bar { height: 8px; background: rgba(255, 255, 255, 0.06); border-radius: 4px; margin-top: 8px; overflow: hidden; }
+.d2-bar-fill { height: 100%; border-radius: 4px; }
+.d2-bar-fill.zc-zone-n { background: var(--series-1); }
+.d2-bar-fill.zc-zone-s { background: var(--series-2); }
+.d2-bar-fill.zc-zone-w { background: var(--series-3); }
+.d2-reason { font-size: 12px; color: var(--ink-2); margin-top: 6px; }
+.d2-score { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.d2-score-unit { font-size: 12px; color: var(--ink-3); margin-left: 2px; }
+
+/* ==================== D3 事件列表面板 ==================== */
+.table-wrap { overflow-x: auto; }
+.ev-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ev-table th {
+  text-align: left; color: var(--ink-3); font-weight: 500;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.ev-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; font-variant-numeric: normal; }
+.reason-cell { max-width: 220px; }
+.vd summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.vd summary:hover { color: var(--ink); }
+.vd-table { border-collapse: collapse; font-size: 11px; margin-top: 6px; width: 100%; }
+.vd-table th, .vd-table td { padding: 4px 8px; border: 1px solid var(--border); text-align: left; }
+.btn-intervene {
+  background: var(--series-1); color: #fff; border: none; border-radius: 6px;
+  padding: 6px 14px; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.btn-intervene:hover { filter: brightness(1.12); }
+.no-action { color: var(--ink-3); }
+
+/* ==================== 运行日志面板 ==================== */
+#log-panel {
+  max-height: 280px; overflow-y: auto;
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+}
+.log-line { padding: 2px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.05); }
+.log-time { color: var(--ink-3); margin-right: 8px; font-variant-numeric: tabular-nums; }
+.log-recv  { color: var(--ink-2); }
+.log-info  { color: var(--ink-3); }
+.log-dedup { color: var(--st-warning); }
+.log-late  { color: var(--st-warning); }
+.log-order { color: var(--series-1); }
+.log-event { color: var(--series-3); }
+.log-warn  { color: var(--st-critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>AirGuard 校园空气质量监测台</h1>
+      <div class="subtitle">订阅 airguard/zones/all · MQTT over WebSocket · ws://10.102.128.15:8083/mqtt（备选 127.0.0.1）</div>
+    </div>
+    <span id="conn-badge"><span class="dot"></span><span id="conn-text">连接中…</span></span>
+  </header>
+
+  <!-- D1 多区域卡片面板 -->
+  <div id="d1-cards"></div>
+
+  <!-- D2 优先关注面板 -->
+  <section class="panel">
+    <h2>D2 优先关注（分数 = 环境权重 × 2 + crowdLevel，按分数降序）</h2>
+    <div id="d2-panel"></div>
+  </section>
+
+  <!-- D3 事件列表面板 -->
+  <section class="panel">
+    <h2>D3 事件列表（OPEN 待处理 / HANDLING 处理中 / RECOVERED 已恢复）</h2>
+    <div id="d3-events"></div>
+  </section>
+
+  <!-- 运行日志面板：去重/乱序/迟到/状态迁移的证据链 -->
+  <section class="panel">
+    <h2>运行日志</h2>
+    <div id="log-panel"></div>
+  </section>
+</div>
+
+<script>
+/* =====================================================================
+ * 第一部分：常量与纯工具函数
+ * ===================================================================== */
+
+// 固定三区域（禁止新增/修改）；ZONE_NAMES 仅作界面显示标签
+const VALID_ZONES = ['zone-n', 'zone-s', 'zone-w'];
+const ZONE_NAMES = { 'zone-n': '宿舍区', 'zone-s': '教学区', 'zone-w': '食堂区' };
+
+// 消息缓冲防抖参数：300ms 收集窗口（乱序消息重排）+ 1000ms 上限（防消息流饿死）
+const FLUSH_DELAY_MS = 300;
+const FLUSH_MAX_WAIT_MS = 1000;
+
+// 状态中文标签与权重（D2 环境权重：重度4 / 轻度3 / 通风不足2 / 正常1）
+const STATUS_LABELS = { heavy: '重度污染', light: '轻度污染', vent: '通风不足风险', normal: '正常' };
+const ENV_WEIGHT = { heavy: 4, light: 3, vent: 2, normal: 1 };
+// 环境状态徽章配色：按严重度顺序映射到固定状态色（正常<通风不足<轻度<重度）
+const STATUS_CSS = { heavy: 'st-critical', light: 'st-serious', vent: 'st-warning', normal: 'st-good' };
+// 事件状态显示
+const EVENT_STATUS_LABELS = { OPEN: '待处理', HANDLING: '处理中', RECOVERED: '已恢复' };
+const EVENT_STATUS_CSS = { OPEN: 'st-warning', HANDLING: 'st-serious', RECOVERED: 'st-good' };
+const LOG_TYPE_LABELS = { recv: '收到', dedup: '去重', late: '迟到', order: '排序', event: '事件', warn: '警告', info: '信息' };
+
+// MQTT 连接配置：候选地址依次尝试（首选本机 IPv4，备选回环 127.0.0.1）；
+// 更换网络环境只需改这里，与 mqtt_publish.py 保持一致
+const MQTT_BROKER_CANDIDATES = ['ws://10.102.128.15:8083/mqtt', 'ws://127.0.0.1:8083/mqtt'];
+const MQTT_TOPIC = 'airguard/zones/all';
+
+/** 去重键：zoneId 与 time 拼接（C11） */
+function hashKeyStr(zoneId, timeStr) { return zoneId + '|' + timeStr; }
+
+/** djb2 字符串哈希，用于 zoneId+time 去重 */
+function djb2(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) ^ str.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+const dedupHash = (zoneId, timeStr) => djb2(hashKeyStr(zoneId, timeStr));
+
+/** HTML 转义：所有来自报文的字符串进入 innerHTML 前必须经过此函数 */
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+const fmt = n => Math.round(n);
+function fmtTime(ms) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); }
+/** 取 ISO 时间串的时:分:秒片段，日志用 */
+function shortTime(iso) { return String(iso).slice(11, 19); }
+
+/* =====================================================================
+ * D1 核心：status 严格按顺序计算（C3）
+ * 1. pm25>150 → 重度污染
+ * 2. 否则 pm25>75 → 轻度污染
+ * 3. 否则 co2>=1500 → 通风不足风险
+ * 4. 其余 → 正常
+ * 顺序禁止调整；一律代码计算，忽略报文自带的 status 字段，禁止硬编码。
+ * ===================================================================== */
+function computeStatus(pm25, co2) {
+  if (pm25 > 150) return 'heavy';
+  if (pm25 > 75) return 'light';
+  if (co2 >= 1500) return 'vent';
+  return 'normal';
+}
+/** 环境权重：重度4 / 轻度3 / 通风不足2 / 正常1（C4） */
+function envWeightOf(statusCode) { return ENV_WEIGHT[statusCode]; }
+
+/** 是否需人工复核（C5）：crowdSource=="model" 且 confidence<0.6。
+ *  confidence 缺失按 <0.6 保守处理。 */
+function needsReviewOf(msg) {
+  return msg.crowdSource === 'model' && !(typeof msg.confidence === 'number' && msg.confidence >= 0.6);
+}
+
+/* =====================================================================
+ * D2 核心：优先打分（独立函数，不写死任何 zoneId，更换输入数据结果随之变化）
+ * 分数 = 环境权重 × 2 + crowdLevel；
+ * 需人工复核时该 crowdLevel 不参与打分。
+ * ===================================================================== */
+function scorePriority(msg, status) {
+  const w = envWeightOf(status);
+  if (needsReviewOf(msg)) {
+    return {
+      score: w * 2,
+      needReview: true,
+      reason: '模型人群数据置信度' + (msg.confidence == null ? '缺失' : msg.confidence) +
+              ' < 0.6，标记需人工复核，crowdLevel=' + msg.crowdLevel + ' 不计分；' +
+              '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 = ' + (w * 2)
+    };
+  }
+  return {
+    score: w * 2 + msg.crowdLevel,
+    needReview: false,
+    reason: '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 + crowdLevel' +
+            msg.crowdLevel + ' = ' + (w * 2 + msg.crowdLevel)
+  };
+}
+
+/** 核验数据快照（verifyDataList 条目） */
+function snapshot(msg, note) {
+  return {
+    time: msg.time,
+    pm25: msg.pm25,
+    co2: msg.co2,
+    crowdLevel: msg.crowdLevel,
+    status: computeStatus(msg.pm25, msg.co2),
+    note: note
+  };
+}
+
+/** 问题描述文案（由计算出的状态生成，禁止硬编码报文值） */
+function problemDescOf(status, msg) {
+  if (status === 'heavy') return '重度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'light') return '轻度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'vent') return '通风不足风险（CO2=' + msg.co2 + '）';
+  return '正常';
+}
+
+/* =====================================================================
+ * 第二部分：后端逻辑层（纯函数 + 状态对象，完全不碰 DOM）
+ * 每 zone 独立状态对象 —— 严格隔离，禁止串数据（C1）
+ * ===================================================================== */
+
+function newZoneState(zoneId) {
+  return {
+    zoneId: zoneId,
+    lastMsg: null,                  // D1 当前最新数据
+    lastProcessedTimeMs: -Infinity, // 已处理消息的最大时间戳（迟到判定基准）
+    activeEventId: null,            // 当前活动事件（OPEN/HANDLING）
+    events: [],                     // 该 zone 全部事件（含 RECOVERED）
+    seenHashes: new Map(),          // 去重哈希 -> 登记时刻
+    pendingQueue: [],               // 待排序处理队列（乱序消息按 time 重排）
+    flushTimer: null,
+    flushFirstArrival: 0,           // 防抖 max-wait 记录
+    eventSeq: 0                     // 事件编号（生成全局唯一 event_id）
+  };
+}
+
+function createZoneStates() {
+  const states = {};
+  VALID_ZONES.forEach(z => { states[z] = newZoneState(z); });
+  return states;
+}
+
+const state = createZoneStates();           // 三 zone 状态字典，键严格为 zoneId
+const originWeights = new Map();            // event_id -> 创建时环境权重（内部辅助，
+                                            // 不写入 event 对象，保持 event 固定 8 字段）
+
+let arrivalSeqGlobal = 0;                   // 全局到达序号（乱序排序稳定性次键）
+const backendLogs = [];                     // 运行日志（UI 订阅展示）
+function log(type, text) {
+  backendLogs.unshift({
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    type: type, text: text
+  });
+  if (backendLogs.length > 200) backendLogs.pop();
+}
+
+/** 当前活动事件（OPEN/HANDLING）；RECOVERED 后 activeEventId 已清空 */
+function activeEventOf(zone) {
+  if (!zone.activeEventId) return null;
+  return zone.events.find(e => e.event_id === zone.activeEventId) || null;
+}
+
+/** 该 zone 最近（startTime 最新）的事件，迟到消息的历史追加目标 */
+function latestEventOf(zone) {
+  if (!zone.events.length) return null;
+  return zone.events.reduce((a, b) =>
+    (Date.parse(b.startTime) > Date.parse(a.startTime) ? b : a), zone.events[0]);
+}
+
+/* ---------- 报文解析与校验（C2：统一JSON报文） ---------- */
+function parseMsgPayload(raw) {
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return { ok: false, error: 'JSON解析失败: ' + e.message }; }
+  if (!data || typeof data !== 'object') return { ok: false, error: '报文不是JSON对象' };
+  // 未知 zoneId 直接拒收：严格隔离，绝不落到任何已有 zone 的队列（C1）
+  if (!VALID_ZONES.includes(data.zoneId)) return { ok: false, error: '未知zoneId: ' + data.zoneId };
+  if (typeof data.pm25 !== 'number' || !isFinite(data.pm25)) return { ok: false, error: 'pm25非法' };
+  if (typeof data.co2 !== 'number' || !isFinite(data.co2)) return { ok: false, error: 'co2非法' };
+  let crowdLevel = data.crowdLevel;
+  if (typeof crowdLevel !== 'number' || !isFinite(crowdLevel)) crowdLevel = 0;
+  crowdLevel = Math.max(0, Math.min(3, Math.round(crowdLevel))); // 截断到 0-3
+  const timeMs = Date.parse(data.time);
+  if (isNaN(timeMs)) return { ok: false, error: 'time非法: ' + data.time };
+  return {
+    ok: true,
+    msg: {
+      zoneId: data.zoneId,
+      pm25: data.pm25,
+      co2: data.co2,
+      crowdLevel: crowdLevel,
+      time: String(data.time),        // 原始字符串（去重键）
+      timeMs: timeMs,                 // epoch 毫秒（排序比较）
+      crowdSource: data.crowdSource,  // 可选："model" 表示人流来自模型检测
+      confidence: data.confidence,    // 可选：模型置信度 0-1
+      arrivalSeq: 0                   // 到达序号
+      // 注意：报文的 status 字段被有意忽略 —— 状态一律由 computeStatus 计算（C3）
+    }
+  };
+}
+
+/* ---------- 消息管线入口：校验 → 去重 → 入队 → 防抖排序处理 ---------- */
+function onMessageReceived(raw) {
+  const parsed = parseMsgPayload(raw);
+  if (!parsed.ok) { log('warn', '报文拒收: ' + parsed.error); return; }
+  const msg = parsed.msg;
+  const zone = state[msg.zoneId];
+  msg.arrivalSeq = ++arrivalSeqGlobal;
+
+  // 去重（C11）：zoneId+time 哈希；命中即丢弃，未命中的哈希在【入队时】登记，
+  // 保证同一收集窗口内先后到达的重复消息在排序前就被拦截。
+  const h = dedupHash(msg.zoneId, msg.time);
+  if (zone.seenHashes.has(h)) {
+    log('dedup', msg.zoneId + ' 重复消息丢弃 (hash=' + h + ', time=' + shortTime(msg.time) + ')');
+    return;
+  }
+  zone.seenHashes.set(h, Date.now());
+
+  log('recv', msg.zoneId + ' 收到报文 pm25=' + msg.pm25 + ' co2=' + msg.co2 +
+      ' crowd=' + msg.crowdLevel + ' time=' + msg.time);
+  zone.pendingQueue.push(msg);
+  scheduleFlush(zone);
+}
+
+/** 防抖调度：300ms trailing debounce + 1000ms max-wait（消息流不断时也不会饿死） */
+function scheduleFlush(zone) {
+  if (zone.flushFirstArrival === 0) zone.flushFirstArrival = Date.now();
+  if (zone.flushTimer) clearTimeout(zone.flushTimer);
+  const waited = Date.now() - zone.flushFirstArrival;
+  const delay = Math.max(0, Math.min(FLUSH_DELAY_MS, FLUSH_MAX_WAIT_MS - waited));
+  zone.flushTimer = setTimeout(() => flushZone(zone), delay);
+}
+
+/** 冲刷队列：乱序消息按 time 升序排序后再执行业务逻辑（C11） */
+function flushZone(zone) {
+  zone.flushTimer = null;
+  zone.flushFirstArrival = 0;
+  if (!zone.pendingQueue.length) return;
+  // 稳定排序：主键 timeMs，次键到达序号（同时间戳按到达顺序）
+  zone.pendingQueue.sort((a, b) => (a.timeMs - b.timeMs) || (a.arrivalSeq - b.arrivalSeq));
+  const batch = zone.pendingQueue.splice(0);
+  if (batch.length > 1) {
+    log('order', zone.zoneId + ' 乱序重排: ' + batch.map(m => shortTime(m.time)).join(' → '));
+  }
+  batch.forEach(m => processOne(zone, m));
+  render();
+}
+
+/** 单条消息处理：迟到判定 → 历史追加 或 业务应用 */
+function processOne(zone, msg) {
+  if (msg.timeMs <= zone.lastProcessedTimeMs) { handleLate(zone, msg); return; }
+  applyMessage(zone, msg);
+}
+
+/** 迟到旧消息处理（C10 规则5）：
+ *  对任何状态（OPEN/HANDLING/RECOVERED）的迟到消息统一只追加历史，不更新 D1、不驱动任何状态迁移。
+ *  理由：迟到消息在时间上不是"后续新消息"，若允许它触发恢复/恶化/新建，
+ *  将违反规则3（仅后续新MQTT数据可恢复）与规则5（RECOVERED不可被旧消息回退）。 */
+function handleLate(zone, msg) {
+  const ev = latestEventOf(zone);
+  if (ev) {
+    ev.verifyDataList.push(snapshot(msg, '迟到消息（旧时间戳）：仅追加历史，不参与状态判定'));
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ') → 仅追加到事件 ' +
+        ev.event_id + ' 的 verifyDataList 历史');
+  } else {
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ')：该区域无事件记录，仅记日志');
+  }
+}
+
+/** 业务应用：更新 D1 当前值 → 按计算出的状态进入 D3 状态机 */
+function applyMessage(zone, msg) {
+  zone.lastMsg = msg;                  // 仅更新本 zone 的当前值（严格隔离）
+  zone.lastProcessedTimeMs = msg.timeMs;
+  const status = computeStatus(msg.pm25, msg.co2);  // 状态一律代码计算（C3）
+  if (status === 'normal') handleNormal(zone, msg, status);
+  else handleAbnormal(zone, msg, status, envWeightOf(status));
+}
+
+/* ---------- D3 事件状态机（状态转移矩阵见文末注释） ---------- */
+
+/** 新·正常数据 */
+function handleNormal(zone, msg, status) {
+  const ev = activeEventOf(zone);
+  if (!ev) return; // 无活动事件：仅更新 D1
+  if (ev.eventStatus === 'HANDLING') {
+    recoverEvent(zone, ev, msg, status); // 规则3：唯一允许进入 RECOVERED 的入口
+  } else if (ev.eventStatus === 'OPEN') {
+    // 规则3：RECOVERED 只能从 HANDLING 到达，OPEN 收到正常数据保持 OPEN 等待人工干预
+    ev.verifyDataList.push(snapshot(msg, '正常快照：事件保持 OPEN，等待人工点击【执行干预】'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到正常数据但状态为 OPEN，保持待处理');
+  }
+}
+
+/** 新·异常数据（w = 当前消息环境权重） */
+function handleAbnormal(zone, msg, status, w) {
+  const ev = activeEventOf(zone);
+  if (!ev) { createEvent(zone, msg, status, w); return; } // 规则1：检测异常新建事件
+  if (ev.eventStatus === 'OPEN') {
+    // 该 zone 已有活动事件：不重复新建，仅更新问题描述（每 zone 同时最多一个活动事件）
+    ev.problemDesc = problemDescOf(status, msg);
+    ev.verifyDataList.push(snapshot(msg, '持续异常快照：事件保持 OPEN'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 持续异常，保持 OPEN');
+  } else if (ev.eventStatus === 'HANDLING') {
+    const w0 = originWeights.get(ev.event_id) || 1; // 创建时严重度
+    if (w >= w0) {
+      // 规则4：指标恶化（新严重度 >= 创建时严重度，等重也算恶化）→ 回退 OPEN
+      rollbackToOpen(zone, ev, msg, status, w, w0);
+    } else {
+      // 好转但仍异常：保持 HANDLING 继续处理（等待满足恢复条件的新数据）
+      ev.verifyDataList.push(snapshot(msg, '好转但仍异常（严重度' + w + ' < 创建时' + w0 + '）：保持 HANDLING'));
+      log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 好转但仍异常，保持 HANDLING');
+    }
+  }
+}
+
+/** 新建事件（规则1）：event 固定 8 字段（C12） */
+function createEvent(zone, msg, status, w) {
+  zone.eventSeq += 1;
+  const event_id = 'EVT-' + zone.zoneId + '-' + zone.eventSeq;
+  const ev = {
+    event_id: event_id,                              // ① event_id
+    zoneId: zone.zoneId,                             // ② zoneId
+    startTime: msg.time,                             // ③ startTime
+    problemDesc: problemDescOf(status, msg),         // ④ problemDesc
+    priorityReason: scorePriority(msg, status).reason, // ⑤ priorityReason（冻结为创建时理由）
+    userAction: '',                                  // ⑥ userAction（仅由干预按钮写入）
+    verifyDataList: [snapshot(msg, '创建事件快照：检测到异常')], // ⑦ verifyDataList
+    eventStatus: 'OPEN',                             // ⑧ eventStatus
+    recoverTime: null                                // ⑧ recoverTime
+  };
+  originWeights.set(event_id, w); // 创建时严重度存外部 Map，不污染 event 固定字段
+  zone.events.push(ev);
+  zone.activeEventId = event_id;
+  log('event', zone.zoneId + ' 新建事件 ' + event_id + ' [' + STATUS_LABELS[status] + ']，状态=OPEN');
+}
+
+/** 恢复事件（规则3）：仅被 handleNormal 的 HANDLING 分支调用，其他代码路径一律不可达 */
+function recoverEvent(zone, ev, msg, status) {
+  ev.eventStatus = 'RECOVERED';
+  ev.recoverTime = msg.time;
+  ev.verifyDataList.push(snapshot(msg, '恢复快照：新消息指标满足恢复条件（正常），HANDLING→RECOVERED'));
+  zone.activeEventId = null;
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到后续新数据满足恢复条件：HANDLING→RECOVERED');
+}
+
+/** 恶化回退（规则4） */
+function rollbackToOpen(zone, ev, msg, status, w, w0) {
+  ev.eventStatus = 'OPEN';
+  ev.problemDesc = problemDescOf(status, msg);
+  ev.verifyDataList.push(snapshot(msg, '恶化回退快照：新数据严重度' + w + ' >= 创建时' + w0 + '，HANDLING 回退 OPEN'));
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 指标恶化（严重度' + w + '>=' + w0 + '）：HANDLING→OPEN');
+}
+
+/** 人工干预（规则2）：OPEN → HANDLING。仅此一处允许用户操作改变事件状态；
+ *  代码中不存在任何把事件直接置为 RECOVERED 的分支（规则3）。 */
+function handleIntervention(zoneId) {
+  const zone = state[zoneId];
+  const ev = activeEventOf(zone);
+  if (!ev || ev.eventStatus !== 'OPEN') {
+    log('warn', zoneId + ' 干预操作无效：当前无 OPEN 状态的活动事件');
+    return;
+  }
+  ev.eventStatus = 'HANDLING';
+  ev.userAction = '人工点击【执行干预】按钮（' + new Date().toLocaleString('zh-CN', { hour12: false }) + '）';
+  log('event', zoneId + ' 事件 ' + ev.event_id + ' 人工干预：OPEN→HANDLING');
+  render();
+}
+
+/** D2 面板数据源：对三 zone 当前数据打分并按分数降序（C4/C5） */
+function getPriorityList() {
+  const rows = [];
+  VALID_ZONES.forEach(zoneId => {
+    const zone = state[zoneId];
+    if (!zone.lastMsg) return;
+    const status = computeStatus(zone.lastMsg.pm25, zone.lastMsg.co2);
+    const p = scorePriority(zone.lastMsg, status);
+    rows.push({
+      zoneId: zoneId, zoneName: ZONE_NAMES[zoneId], status: status,
+      score: p.score, reason: p.reason, needReview: p.needReview
+    });
+  });
+  rows.sort((a, b) => b.score - a.score);
+  return rows;
+}
+
+/* =====================================================================
+ * 第三部分：UI 渲染层（只读状态，统一 render() 全量重绘）
+ * ===================================================================== */
+
+function statusBadgeHtml(statusCode) {
+  return '<span class="badge ' + STATUS_CSS[statusCode] + '"><span class="dot"></span>' +
+         STATUS_LABELS[statusCode] + '</span>';
+}
+
+function render() {
+  renderZoneCards();
+  renderPriorityPanel();
+  renderEventPanel();
+  renderLogPanel();
+}
+
+/** D1：多区域卡片 */
+function renderZoneCards() {
+  const root = document.getElementById('d1-cards');
+  root.innerHTML = VALID_ZONES.map(zoneId => {
+    const zone = state[zoneId];
+    const msg = zone.lastMsg;
+    let body;
+    if (!msg) {
+      body = '<div class="card-empty">等待数据…</div>';
+    } else {
+      const status = computeStatus(msg.pm25, msg.co2);
+      body =
+        '<div class="stat-grid">' +
+          '<div class="stat"><div class="stat-label">PM2.5</div><div class="stat-value">' + fmt(msg.pm25) + '</div></div>' +
+          '<div class="stat"><div class="stat-label">CO₂</div><div class="stat-value">' + fmt(msg.co2) + '</div></div>' +
+          '<div class="stat"><div class="stat-label">人流等级</div><div class="stat-value">' + msg.crowdLevel + '</div></div>' +
+        '</div>' +
+        '<div class="card-foot">' +
+          '<span>更新于 ' + fmtTime(msg.timeMs) + '</span>' +
+          (needsReviewOf(msg) ? '<span class="badge st-warning"><span class="dot"></span>需人工复核</span>' : '') +
+        '</div>';
+    }
+    return '<article class="zone-card">' +
+      '<div class="card-head">' +
+        '<span class="zone-chip zc-' + zoneId + '">' + zoneId + ' · ' + ZONE_NAMES[zoneId] + '</span>' +
+        (msg ? statusBadgeHtml(computeStatus(msg.pm25, msg.co2)) : '') +
+      '</div>' + body +
+    '</article>';
+  }).join('');
+}
+
+/** D2：优先关注面板（展示优先 zoneId 与判断理由） */
+function renderPriorityPanel() {
+  const root = document.getElementById('d2-panel');
+  const rows = getPriorityList();
+  if (!rows.length) { root.innerHTML = '<div class="panel-empty">暂无数据…</div>'; return; }
+  const maxScore = 11; // 理论最高分：重度4×2 + crowdLevel3
+  root.innerHTML = rows.map((r, i) =>
+    '<div class="d2-row">' +
+      '<div class="d2-rank">#' + (i + 1) + '</div>' +
+      '<div class="d2-main">' +
+        '<div class="d2-head">' +
+          '<span class="zone-chip zc-' + r.zoneId + '">' + r.zoneId + ' · ' + r.zoneName + '</span>' +
+          statusBadgeHtml(r.status) +
+          (r.needReview ? '<span class="badge st-warning"><span class="dot"></span>需人工复核</span>' : '') +
+        '</div>' +
+        '<div class="d2-bar"><div class="d2-bar-fill zc-' + r.zoneId + '" style="width:' +
+          (r.score / maxScore * 100).toFixed(1) + '%"></div></div>' +
+        '<div class="d2-reason">判断理由：' + escapeHtml(r.reason) + '</div>' +
+      '</div>' +
+      '<div class="d2-score">' + r.score + '<span class="d2-score-unit">分</span></div>' +
+    '</div>'
+  ).join('');
+}
+
+/** D3：事件列表面板（固定 8 字段 + 核验数据 + 干预按钮） */
+function renderEventPanel() {
+  const root = document.getElementById('d3-events');
+  const all = [];
+  VALID_ZONES.forEach(z => all.push(...state[z].events)); // 汇总三 zone 事件（数据本身仍按 zone 归属）
+  all.sort((a, b) => Date.parse(b.startTime) - Date.parse(a.startTime)); // 新事件在前
+  if (!all.length) { root.innerHTML = '<div class="panel-empty">暂无事件…</div>'; return; }
+  root.innerHTML =
+    '<div class="table-wrap"><table class="ev-table">' +
+    '<thead><tr>' +
+    '<th>事件ID</th><th>区域</th><th>开始时间</th><th>问题描述</th><th>优先级理由</th>' +
+    '<th>人工操作</th><th>核验数据</th><th>状态</th><th>恢复时间</th><th>操作</th>' +
+    '</tr></thead><tbody>' + all.map(rowHtml).join('') + '</tbody></table></div>';
+}
+
+function rowHtml(ev) {
+  const vd = ev.verifyDataList || [];
+  const vdHtml =
+    '<details class="vd"><summary>核验数据（' + vd.length + ' 条）</summary>' +
+    '<table class="vd-table"><thead><tr><th>时间</th><th>PM2.5</th><th>CO₂</th><th>人流</th><th>状态</th><th>标注</th></tr></thead><tbody>' +
+    vd.map(v =>
+      '<tr><td>' + escapeHtml(fmtTime(Date.parse(v.time))) + '</td>' +
+      '<td>' + v.pm25 + '</td><td>' + v.co2 + '</td><td>' + v.crowdLevel + '</td>' +
+      '<td>' + statusBadgeHtml(v.status) + '</td><td>' + escapeHtml(v.note || '') + '</td></tr>'
+    ).join('') +
+    '</tbody></table></details>';
+  // 【执行干预】按钮仅对 OPEN 事件渲染（规则2）；不存在任何"直接恢复"按钮（规则3）
+  const action = ev.eventStatus === 'OPEN'
+    ? '<button class="btn-intervene" onclick="handleIntervention(\'' + ev.zoneId + '\')">执行干预</button>'
+    : '<span class="no-action">—</span>';
+  return '<tr>' +
+    '<td class="mono">' + escapeHtml(ev.event_id) + '</td>' +
+    '<td><span class="zone-chip zc-' + ev.zoneId + '">' + escapeHtml(ev.zoneId) + '</span></td>' +
+    '<td>' + escapeHtml(fmtTime(Date.parse(ev.startTime))) + '</td>' +
+    '<td>' + escapeHtml(ev.problemDesc || '') + '</td>' +
+    '<td class="reason-cell">' + escapeHtml(ev.priorityReason || '') + '</td>' +
+    '<td>' + escapeHtml(ev.userAction || '—') + '</td>' +
+    '<td>' + vdHtml + '</td>' +
+    '<td><span class="badge ' + EVENT_STATUS_CSS[ev.eventStatus] + '"><span class="dot"></span>' +
+         EVENT_STATUS_LABELS[ev.eventStatus] + '</span></td>' +
+    '<td>' + (ev.recoverTime ? escapeHtml(fmtTime(Date.parse(ev.recoverTime))) : '—') + '</td>' +
+    '<td>' + action + '</td>' +
+  '</tr>';
+}
+
+/** 运行日志面板（去重/乱序/迟到/状态迁移证据链） */
+function renderLogPanel() {
+  const root = document.getElementById('log-panel');
+  root.innerHTML = backendLogs.map(l =>
+    '<div class="log-line log-' + l.type + '"><span class="log-time">' + l.time + '</span>' +
+    '[' + (LOG_TYPE_LABELS[l.type] || l.type) + '] ' + escapeHtml(l.text) + '</div>'
+  ).join('') || '<div class="panel-empty">暂无日志…</div>';
+}
+
+/* =====================================================================
+ * 第四部分：MQTT over WebSocket 连接
+ * ===================================================================== */
+
+let client = null;
+let connectAttempt = 0;   // 尝试序号：新候选尝试会取代旧尝试（防止旧连接事件串扰）
+
+function setConnState(text, cls) {
+  const badge = document.getElementById('conn-badge');
+  document.getElementById('conn-text').textContent = text;
+  badge.className = cls || '';
+}
+
+function initMqtt() { attemptConnect(0); }
+
+/** 依次尝试候选地址连接：单候选 4 秒连不上即切换下一个，全部失败后从头循环重试；
+ *  已连接后由 mqtt.js 内置机制自动重连。 */
+function attemptConnect(index) {
+  const url = MQTT_BROKER_CANDIDATES[index % MQTT_BROKER_CANDIDATES.length];
+  const attemptId = ++connectAttempt;
+  setConnState('连接中 ' + url + ' …', 'reconnecting');
+  log('info', '尝试连接 ' + url + ' …');
+  const c = mqtt.connect(url, {
+    clientId: 'airguard-web-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 2000,   // 已连接后的自动重连间隔
+    connectTimeout: 4000,    // 连接阶段超时：快速切换下一候选，便于排障
+    keepalive: 30,
+    path: '/mqtt'            // 与 URL 中的路径双保险
+  });
+  let connected = false;
+  c.on('connect', () => {
+    connected = true;
+    if (attemptId !== connectAttempt) { c.end(); return; } // 已被更新的尝试取代
+    client = c;
+    setConnState('已连接 ' + url, 'connected');
+    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + '（此时运行 mqtt_publish.py 即可收到数据）');
+    c.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
+      if (err) log('warn', '订阅失败: ' + err.message);
+    });
+  });
+  c.on('error', (e) => {
+    if (attemptId !== connectAttempt) return;
+    if (connected) {
+      setConnState('连接错误', 'disconnected');
+      log('warn', 'MQTT错误: ' + (e && e.message ? e.message : e));
+      return;
+    }
+    // 连接阶段失败：切换下一个候选地址
+    log('warn', '连接 ' + url + ' 失败（' + (e && e.message ? e.message : e) + '），切换下一候选');
+    c.end(true);
+    attemptConnect(index + 1);
+  });
+  c.on('close', () => {
+    if (attemptId === connectAttempt && connected) setConnState('已断开', 'disconnected');
+  });
+  c.on('reconnect', () => { if (attemptId === connectAttempt) setConnState('重连中…', 'reconnecting'); });
+  c.on('offline', () => { if (attemptId === connectAttempt) setConnState('离线', 'disconnected'); });
+  c.on('message', (topic, payload) => {
+    if (attemptId === connectAttempt) onMessageReceived(payload.toString());
+  });
+}
+
+/* =====================================================================
+ * 启动：mqtt.js 主 CDN（jsdelivr）加载失败时回退 unpkg，均锁 @5 大版本
+ * ===================================================================== */
+window.addEventListener('DOMContentLoaded', () => {
+  if (window.mqtt) {
+    initApp();
+  } else {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/mqtt@5/dist/mqtt.min.js';
+    s.onload = initApp;
+    s.onerror = () => {
+      setConnState('mqtt.js CDN 加载失败', 'disconnected');
+      log('warn', 'mqtt.js 两个公开 CDN 均加载失败，请检查网络');
+    };
+    document.head.appendChild(s);
+  }
+});
+
+function initApp() {
+  log('info', '监测台初始化完成');
+  render();
+  initMqtt();
+}
+
+/* =====================================================================
+ * 附：D3 状态转移矩阵（w=新消息环境权重，w0=事件创建时权重）
+ * ┌────────────┬────────────────────┬───────────────────────────┬──────────────────┐
+ * │ 当前状态    │ 新·正常            │ 新·异常                    │ 迟到旧消息        │
+ * ├────────────┼────────────────────┼───────────────────────────┼──────────────────┤
+ * │ 无活动事件  │ 仅更新D1           │ 新建事件OPEN(规则1)        │ 仅追加历史(规则5) │
+ * │ OPEN       │ 保持OPEN(规则3)    │ 保持OPEN,更新problemDesc   │ 仅追加历史(规则5) │
+ * │ HANDLING   │ RECOVERED(规则3)   │ w>=w0回退OPEN(规则4)       │ 仅追加历史(规则5) │
+ * │            │                    │ w<w0保持HANDLING           │                  │
+ * │ RECOVERED  │ 仅更新D1           │ 新建事件OPEN(规则1+5)      │ 仅追加历史(规则5) │
+ * └────────────┴────────────────────┴───────────────────────────┴──────────────────┘
+ * 另：消息去重(zoneId+time哈希)、乱序按time排序(规则6)；按钮仅OPEN→HANDLING(规则2)。
+ * ===================================================================== */
+</script>
+</body>
+</html>

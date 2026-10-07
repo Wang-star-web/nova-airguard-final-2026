@@ -402,6 +402,83 @@ def d2_case3(client, args):
     print("\nd2_case3 已发送全部 3 条报文（zone-n/zone-s/zone-w），脚本结束。")
 
 
+# ---------------- D3 测试取证场景（一次性发送，发送完成即退出） ----------------
+# 说明：全部使用 zone-w，覆盖 D3 状态机关键路径：
+#   abnormal→OPEN（规则1）；干预后新数据→RECOVERED（规则3）；恶化→回退OPEN（规则4）；
+#   重复消息去重（规则6）；迟到旧报文仅追加历史（规则5）。
+# improve/worsen 需要人工在页面点击【执行干预】按钮：
+# RECOVERED 只能从 HANDLING 到达（规则3），OPEN 状态收到正常数据不会自动恢复。
+
+
+def d3_case_abnormal(client, args):
+    """D3 取证·异常事件：zone-w 重度污染 → 新建 OPEN 事件（规则1），一次性发送后退出"""
+    banner("d3_case_abnormal D3 测试取证·异常事件",
+           ["zone-w: pm25=200（>150 重度污染）→ 检测异常，新建事件，状态=OPEN（规则1）",
+            "一次性发送报文后脚本结束"])
+    send(client, build_msg("zone-w", 200, 700, 2),
+         "D3 新建事件：eventStatus=OPEN，problemDesc=重度污染")
+    print("\nd3_case_abnormal 已发送 zone-w 异常报文（pm25=200 重度污染），"
+          "预期监测台新建 OPEN 事件（规则1），脚本结束。")
+
+
+def d3_case_improve(client, args):
+    """D3 取证·恢复流程：2 条连续改善报文（重度→正常）触发 RECOVERED（规则3）"""
+    banner("d3_case_improve D3 测试取证·恢复流程",
+           ["① zone-w: pm25=160（重度污染）→ 新建 OPEN",
+            "② 你点击【执行干预】→ HANDLING",
+            "③ zone-w: pm25=40, co2=600（正常）→ 满足恢复条件 → RECOVERED（规则3）",
+            "说明：RECOVERED 只能从 HANDLING 到达，OPEN 状态收到正常数据不会自动恢复"])
+    m1 = build_msg("zone-w", 160, 800, 2, offset_sec=0)   # ① 重度 → OPEN
+    send(client, m1, "新建事件 OPEN（重度污染）")
+    wait_enter("点击该事件行的【执行干预】按钮（OPEN→HANDLING）")
+    m2 = build_msg("zone-w", 40, 600, 0, offset_sec=30)   # ③ 正常 → RECOVERED
+    send(client, m2, "后续新数据满足恢复条件：HANDLING→RECOVERED，recoverTime 被记录")
+    print("\nd3_case_improve 已发送 2 条连续改善报文（重度→正常），"
+          "预期事件状态为 RECOVERED（规则3），脚本结束。")
+
+
+def d3_case_worsen(client, args):
+    """D3 取证·恶化回退：HANDLING 后收到更严重数据 → 回退 OPEN（规则4）"""
+    banner("d3_case_worsen D3 测试取证·恶化回退",
+           ["① zone-w: pm25=100（轻度污染，严重度3）→ 新建 OPEN",
+            "② 你点击【执行干预】→ HANDLING",
+            "③ zone-w: pm25=200（重度污染，严重度4 >= 创建时3）→ 回退 OPEN（规则4）"])
+    m1 = build_msg("zone-w", 100, 800, 2, offset_sec=0)   # ① 轻度 → OPEN
+    send(client, m1, "新建事件 OPEN（轻度污染）")
+    wait_enter("点击该事件行的【执行干预】按钮（OPEN→HANDLING）")
+    m2 = build_msg("zone-w", 200, 800, 3, offset_sec=30)  # ③ 重度 → 恶化回退
+    send(client, m2, "指标恶化（严重度4>=创建时3）：HANDLING→OPEN，problemDesc 更新")
+    print("\nd3_case_worsen 已发送恶化报文（pm25=200 重度污染），"
+          "预期事件从 HANDLING 回退为 OPEN（规则4），脚本结束。")
+
+
+def d3_case_dup(client, args):
+    """D3 取证·重复消息：同 zoneId+time 报文连发 3 遍，后 2 遍被去重丢弃（规则6）"""
+    banner("d3_case_dup D3 测试取证·重复消息",
+           ["zone-w: pm25=160（重度污染），zoneId+time 完全相同的报文连发 3 遍",
+            "预期：第 1 遍新建 OPEN 事件，第 2、3 遍被去重丢弃（规则6）"])
+    m = build_msg("zone-w", 160, 800, 2)   # 重度 → 第 1 遍新建 OPEN
+    send(client, m, "第 1 遍：新建事件 OPEN")
+    send(client, dict(m), "第 2 遍：同 zoneId+time → 监测台日志显示【重复消息丢弃】", gap=0.2)
+    send(client, dict(m), "第 3 遍：同上，再次被去重丢弃", gap=0.2)
+    print("\nd3_case_dup 已发送 3 遍完全相同的报文，"
+          "预期仅第 1 遍生效（新建 OPEN），后 2 遍被去重丢弃（规则6），脚本结束。")
+
+
+def d3_case_late(client, args):
+    """D3 取证·迟到旧报文：发送时间戳为 5 分钟前的旧报文 → 仅追加历史（规则5）"""
+    banner("d3_case_late D3 测试取证·迟到旧报文",
+           ["① zone-w: pm25=160（当前时间）→ 新建 OPEN（确立已处理时间基准）",
+            "② zone-w: pm25=190（时间戳 = 5 分钟前）→ 迟到旧报文",
+            "预期：事件状态保持不变，旧报文仅追加到 verifyDataList 历史（规则5）"])
+    m1 = build_msg("zone-w", 160, 800, 2, offset_sec=0)     # ① 当前时间 → OPEN
+    send(client, m1, "新建事件 OPEN")
+    m2 = build_msg("zone-w", 190, 800, 3, offset_sec=-300)  # ② 5 分钟前 → 迟到
+    send(client, m2, "迟到旧报文（时间戳早于已处理时间）→ 仅追加 verifyDataList 历史，状态不变")
+    print("\nd3_case_late 已发送 1 条当前报文 + 1 条 5 分钟前的迟到旧报文，"
+          "预期事件状态不变、旧报文仅追加历史（规则5），脚本结束。")
+
+
 # 场景注册表：argparse choices 与分发
 SCENARIOS = {
     "normal": run_normal,
@@ -418,6 +495,11 @@ SCENARIOS = {
     "d2_case1": d2_case1,
     "d2_case2": d2_case2,
     "d2_case3": d2_case3,
+    "d3_case_abnormal": d3_case_abnormal,
+    "d3_case_improve": d3_case_improve,
+    "d3_case_worsen": d3_case_worsen,
+    "d3_case_dup": d3_case_dup,
+    "d3_case_late": d3_case_late,
 }
 
 

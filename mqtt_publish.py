@@ -37,6 +37,9 @@
      model       模型低置信度      D2 标记【需人工复核】，crowdLevel 不计分
      stream      持续上报         模拟真实传感器周期性上报（Ctrl+C 停止）
      demo        全流程演示        异常→干预→好转→恶化→干预→恢复→迟到→复核
+     d2_case1    D2取证·用例1     一次性发送 zone-n/s/w 三区域报文后退出
+     d2_case2    D2取证·用例2     一次性发送 zone-n/s/w 三区域报文后退出
+     d2_case3    D2取证·用例3     手动JSON+crowdSource/confidence，一次性发送后退出
 
  【提示】每个场景演示前建议刷新监测台页面（F5）以获得确定性结果。
      持续演示推荐: py mqtt_publish.py stream --all-zones （Ctrl+C 停止）
@@ -343,6 +346,62 @@ def run_stream(client, args):
         print("\n已停止持续上报（Ctrl+C）")
 
 
+# ---------------- D2 测试取证场景（一次性发送，发送完成即退出） ----------------
+# 说明：使用真实三区域 zone-n/zone-s/zone-w（均为 ZONE_NAMES 合法值，
+# 满足 build_msg 断言）；监测台可正常接收并实时展示 D2 打分结果。
+
+
+def d2_case1(client, args):
+    """D2 测试取证·用例1：三区域梯度打分（正常/正常/重度污染），一次性发送后退出"""
+    banner("d2_case1 D2 测试取证·用例1",
+           ["zone-n: pm25=35, co2=600, crowdLevel=0（正常）",
+            "zone-s: pm25=35, co2=920, crowdLevel=1（正常）",
+            "zone-w: pm25=160, co2=900, crowdLevel=2（重度污染）",
+            "一次性发送全部 3 条报文后脚本结束"])
+    send(client, build_msg("zone-n", 35, 600, 0))
+    send(client, build_msg("zone-s", 35, 920, 1))
+    send(client, build_msg("zone-w", 160, 900, 2))
+    print("\nd2_case1 已发送全部 3 条报文（zone-n/zone-s/zone-w），脚本结束。")
+
+
+def d2_case2(client, args):
+    """D2 测试取证·用例2：三区域梯度打分（正常/重度污染/正常），一次性发送后退出"""
+    banner("d2_case2 D2 测试取证·用例2",
+           ["zone-n: pm25=35, co2=600, crowdLevel=0（正常）",
+            "zone-s: pm25=170, co2=950, crowdLevel=3（重度污染）",
+            "zone-w: pm25=38, co2=620, crowdLevel=1（正常）",
+            "一次性发送全部 3 条报文后脚本结束"])
+    send(client, build_msg("zone-n", 35, 600, 0))
+    send(client, build_msg("zone-s", 170, 950, 3))
+    send(client, build_msg("zone-w", 38, 620, 1))
+    print("\nd2_case2 已发送全部 3 条报文（zone-n/zone-s/zone-w），脚本结束。")
+
+
+def d2_case3(client, args):
+    """D2 测试取证·用例3：人工复核（crowdSource/confidence），一次性发送后退出。
+    约束：不调用 build_msg，手动构造完整统一 JSON 报文（额外带 crowdSource/confidence）。"""
+    banner("d2_case3 D2 测试取证·用例3",
+           ["zone-n: pm25=35, co2=600, crowdLevel=0, crowdSource=simulated, confidence=1.0",
+            "zone-s: pm25=40, co2=650, crowdLevel=1, crowdSource=simulated, confidence=1.0",
+            "zone-w: pm25=150, co2=880, crowdLevel=3, crowdSource=model, confidence=0.4（需人工复核）",
+            "一次性发送全部 3 条报文后脚本结束"])
+    # 手动构造完整统一 JSON：status 恒为空字符串（由监测台代码计算，禁止硬编码）
+    msgs = [
+        {"zoneId": "zone-n", "pm25": 35, "co2": 600, "crowdLevel": 0,
+         "status": "", "time": now_iso(0),
+         "crowdSource": "simulated", "confidence": 1.0},
+        {"zoneId": "zone-s", "pm25": 40, "co2": 650, "crowdLevel": 1,
+         "status": "", "time": now_iso(1),
+         "crowdSource": "simulated", "confidence": 1.0},
+        {"zoneId": "zone-w", "pm25": 150, "co2": 880, "crowdLevel": 3,
+         "status": "", "time": now_iso(2),
+         "crowdSource": "model", "confidence": 0.4},
+    ]
+    for m in msgs:
+        send(client, m)
+    print("\nd2_case3 已发送全部 3 条报文（zone-n/zone-s/zone-w），脚本结束。")
+
+
 # 场景注册表：argparse choices 与分发
 SCENARIOS = {
     "normal": run_normal,
@@ -356,7 +415,11 @@ SCENARIOS = {
     "model": run_model,
     "stream": run_stream,
     "demo": run_demo,
+    "d2_case1": d2_case1,
+    "d2_case2": d2_case2,
+    "d2_case3": d2_case3,
 }
+
 
 
 def main():
@@ -368,7 +431,8 @@ def main():
                "提示: 每个场景演示前建议刷新监测台页面(F5)以获得确定性结果。")
     parser.add_argument("scenario", choices=sorted(SCENARIOS.keys()),
                         help="演示场景（normal/abnormal/duplicate/outoforder/late/"
-                             "worsen/improve/recover/model/stream/demo）")
+                             "worsen/improve/recover/model/stream/demo/"
+                             "d2_case1/d2_case2/d2_case3）")
     parser.add_argument("--zone", default="zone-n", choices=sorted(ZONE_NAMES.keys()),
                         help="目标区域（默认 zone-n 宿舍区）")
     parser.add_argument("--all-zones", action="store_true",

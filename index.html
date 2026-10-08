@@ -67,8 +67,9 @@ body {
   margin: 0; background: var(--page); color: var(--ink);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 14px;
+  overflow-y: auto;   /* 明确允许页面纵向滚动，所有面板可上下浏览 */
 }
-.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 24px 48px; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 24px 64px; }
 
 /* ==================== 头部 ==================== */
 header {
@@ -90,11 +91,11 @@ h1 { font-size: 20px; margin: 0; }
 /* ==================== 面板通用 ==================== */
 .panel {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 10px; padding: 16px; margin-top: 16px;
+  border-radius: 10px; padding: 18px 20px; margin-top: 24px;   /* 板块之间留出合理间距，防挤压 */
 }
 .panel h2 {
   font-size: 13px; font-weight: 600; color: var(--ink-2);
-  margin: 0 0 12px; letter-spacing: 1px;
+  margin: 0 0 14px; letter-spacing: 1px;
 }
 .panel-empty { color: var(--ink-3); text-align: center; padding: 18px 0; font-size: 13px; }
 
@@ -126,9 +127,9 @@ h1 { font-size: 20px; margin: 0; }
 .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .stat { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
-.stat-label { font-size: 11px; color: var(--ink-3); }
+.stat-label { font-size: 12px; color: var(--ink-3); }
 .stat-value { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.card-foot { margin-top: 12px; font-size: 11px; color: var(--ink-3); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card-foot { margin-top: 12px; font-size: 12px; color: var(--ink-3); display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
 .card-empty { color: var(--ink-3); padding: 26px 0; text-align: center; font-size: 13px; }
 
 /* ==================== D2 优先关注面板 ==================== */
@@ -142,7 +143,7 @@ h1 { font-size: 20px; margin: 0; }
 .d2-bar-fill.zc-zone-n { background: var(--series-1); }
 .d2-bar-fill.zc-zone-s { background: var(--series-2); }
 .d2-bar-fill.zc-zone-w { background: var(--series-3); }
-.d2-reason { font-size: 12px; color: var(--ink-2); margin-top: 6px; }
+.d2-reason { font-size: 12px; color: var(--ink-2); margin-top: 6px; overflow-wrap: break-word; }
 .d2-score { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .d2-score-unit { font-size: 12px; color: var(--ink-3); margin-left: 2px; }
 
@@ -153,12 +154,12 @@ h1 { font-size: 20px; margin: 0; }
   text-align: left; color: var(--ink-3); font-weight: 500;
   padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
 }
-.ev-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-variant-numeric: tabular-nums; }
-.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; font-variant-numeric: normal; }
+.ev-table td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-variant-numeric: tabular-nums; overflow-wrap: break-word; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; font-variant-numeric: normal; }
 .reason-cell { max-width: 220px; }
 .vd summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
 .vd summary:hover { color: var(--ink); }
-.vd-table { border-collapse: collapse; font-size: 11px; margin-top: 6px; width: 100%; }
+.vd-table { border-collapse: collapse; font-size: 12px; margin-top: 6px; width: 100%; }
 .vd-table th, .vd-table td { padding: 4px 8px; border: 1px solid var(--border); text-align: left; }
 .btn-intervene {
   background: var(--series-1); color: #fff; border: none; border-radius: 6px;
@@ -181,6 +182,18 @@ h1 { font-size: 20px; margin: 0; }
 .log-order { color: var(--series-1); }
 .log-event { color: var(--series-3); }
 .log-warn  { color: var(--st-critical); }
+
+/* ==================== D5 规则 vs ML 组合裁决（新增区域） ==================== */
+.d5-main { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: rgba(255,255,255,.02); }
+.d5-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
+.d5-inputs { font-size: 14px; color: var(--ink); }
+.d5-result-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,.06); font-size: 13px; flex-wrap: wrap; }
+.d5-result-row .k { color: var(--ink-3); flex: none; }
+.d5-final { margin-top: 10px; border: 1px solid var(--series-3); background: rgba(25,158,112,.08); border-radius: 8px; padding: 10px 12px; font-size: 14px; font-weight: 600; overflow-wrap: break-word; }
+.d5-final .k { color: var(--ink-2); font-size: 12px; font-weight: 400; margin-bottom: 4px; }
+.d5-history { margin-top: 10px; }
+.d5-history summary { cursor: pointer; font-size: 12px; color: var(--ink-2); }
+.d5-h-item { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,.05); color: var(--ink-2); flex-wrap: wrap; overflow-wrap: break-word; }
 </style>
 </head>
 <body>
@@ -206,6 +219,12 @@ h1 { font-size: 20px; margin: 0; }
   <section class="panel">
     <h2>D3 事件列表（OPEN 待处理 / HANDLING 处理中 / RECOVERED 已恢复）</h2>
     <div id="d3-events"></div>
+  </section>
+
+  <!-- D5 规则 vs ML 组合裁决面板（新增独立区域，不影响原有面板） -->
+  <section class="panel">
+    <h2>D5 规则 vs ML 组合裁决（IsolationForest · 规则优先策略）</h2>
+    <div id="d5-panel"></div>
   </section>
 
   <!-- 运行日志面板：去重/乱序/迟到/状态迁移的证据链 -->
@@ -242,6 +261,8 @@ const LOG_TYPE_LABELS = { recv: '收到', dedup: '去重', late: '迟到', order
 // 更换网络环境只需改这里，与 mqtt_publish.py 保持一致
 const MQTT_BROKER_CANDIDATES = ['ws://10.102.128.15:8083/mqtt', 'ws://127.0.0.1:8083/mqtt'];
 const MQTT_TOPIC = 'airguard/zones/all';
+const CONTROL_TOPIC = 'airguard/zones/control';  // 跨端干预指令主题（E3发布，四端订阅同步D3状态）
+const D5_TOPIC = 'airguard/zones/d5';            // D5 规则vsML组合裁决结果主题（d5_ml_compare.py 发布）
 
 /** 去重键：zoneId 与 time 拼接（C11） */
 function hashKeyStr(zoneId, timeStr) { return zoneId + '|' + timeStr; }
@@ -586,6 +607,20 @@ function handleIntervention(zoneId) {
   render();
 }
 
+/** 控制主题指令处理（E3 等页面发布【执行干预】指令，跨端同步 D3 状态）。
+ *  指令不进入数据管线（非统一JSON报文且语义是"立即执行"）；
+ *  复用现有 handleIntervention，其幂等守卫保证重复/回环指令无害。 */
+function onControlReceived(raw) {
+  let cmd;
+  try { cmd = JSON.parse(raw); } catch (e) { log('warn', '控制指令解析失败: ' + e.message); return; }
+  if (!cmd || !VALID_ZONES.includes(cmd.zoneId) || cmd.action !== 'intervene') {
+    log('warn', '非法控制指令丢弃: ' + raw);
+    return;
+  }
+  log('event', '收到控制指令（远端页面）：' + cmd.zoneId + ' 执行干预');
+  handleIntervention(cmd.zoneId);
+}
+
 /** D2 面板数据源：对三 zone 当前数据打分并按分数降序（C4/C5） */
 function getPriorityList() {
   const rows = [];
@@ -617,6 +652,7 @@ function render() {
   renderPriorityPanel();
   renderEventPanel();
   renderLogPanel();
+  renderD5Panel();   // D5 新增区域（独立渲染，不影响原有面板）
 }
 
 /** D1：多区域卡片 */
@@ -729,6 +765,69 @@ function renderLogPanel() {
 }
 
 /* =====================================================================
+ * D5 规则 vs ML 组合裁决（新增功能：独立数据区，不触碰原有任何管线）
+ * 数据来源：d5_ml_compare.py 发布到 airguard/zones/d5 的结果报文
+ * ===================================================================== */
+
+const d5Samples = [];   // 最新在前，最多保留 5 条历史
+
+/** D5 报文接收：校验 → 入历史 → 触发刷新（三项结果自动更新） */
+function onD5Received(raw) {
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { log('warn', 'D5报文解析失败: ' + e.message); return; }
+  if (!data || typeof data.pm25 !== 'number' || typeof data.co2 !== 'number' ||
+      typeof data.ruleResult !== 'string' || typeof data.mlResult !== 'string' ||
+      typeof data.finalDecision !== 'string') {
+    log('warn', '非法D5报文丢弃: ' + raw);
+    return;
+  }
+  data.arrival = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  d5Samples.unshift(data);
+  if (d5Samples.length > 5) d5Samples.pop();
+  log('recv', 'D5样本(' + data.sample + ') pm25=' + data.pm25 + ' co2=' + data.co2 +
+      ' 最终裁决: ' + data.finalDecision);
+  render();
+}
+
+/** D5 面板：展示最新样本的 ①固定规则判级 ②ML判断 ③组合裁决最终输出 + 历史 */
+function renderD5Panel() {
+  const root = document.getElementById('d5-panel');
+  if (!d5Samples.length) {
+    root.innerHTML = '<div class="panel-empty">等待 D5 样本报文…（运行 py d5_ml_compare.py 推送后自动刷新）</div>';
+    return;
+  }
+  const s = d5Samples[0];
+  // ① 固定规则判级结果（复用状态徽章配色）
+  let ruleCls = 'st-good';
+  if (s.ruleResult.indexOf('重度') >= 0) ruleCls = 'st-critical';
+  else if (s.ruleResult.indexOf('轻度') >= 0) ruleCls = 'st-serious';
+  else if (s.ruleResult.indexOf('通风不足') >= 0) ruleCls = 'st-warning';
+  const ruleBadge = '<span class="badge ' + ruleCls + '"><span class="dot"></span>' + escapeHtml(s.ruleResult) + '</span>';
+  // ② ML隔离森林判断结果
+  const mlBadge = s.mlResult.indexOf('异常') >= 0
+    ? '<span class="badge st-warning"><span class="dot"></span>' + escapeHtml(s.mlResult) + '</span>'
+    : '<span class="badge st-good"><span class="dot"></span>' + escapeHtml(s.mlResult) + '</span>';
+  root.innerHTML =
+    '<div class="d5-main">' +
+      '<div class="d5-head">' +
+        '<span class="d5-inputs">样本 ' + escapeHtml(s.sample || '') + ' · 输入 pm25=' + s.pm25 + '，co2=' + s.co2 + '</span>' +
+        '<span style="color:var(--ink-3)">接收于 ' + escapeHtml(s.arrival) + '（报文时间 ' + escapeHtml(s.time || '') + '）</span>' +
+      '</div>' +
+      '<div class="d5-result-row"><span class="k">① 固定规则判级结果</span>' + ruleBadge + '</div>' +
+      '<div class="d5-result-row"><span class="k">② ML隔离森林判断结果</span>' + mlBadge + '</div>' +
+      '<div class="d5-final"><div class="k">③ 组合裁决最终输出（规则优先策略）</div>' + escapeHtml(s.finalDecision) + '</div>' +
+    '</div>' +
+    (d5Samples.length > 1
+      ? '<details class="d5-history"><summary>最近样本历史（' + d5Samples.length + ' 条）</summary>' +
+        d5Samples.slice(1).map(h =>
+          '<div class="d5-h-item"><span>样本' + escapeHtml(h.sample) + ' pm25=' + h.pm25 +
+          ' co2=' + h.co2 + '</span><span>' + escapeHtml(h.finalDecision) + '</span></div>'
+        ).join('') +
+        '</details>'
+      : '');
+}
+
+/* =====================================================================
  * 第四部分：MQTT over WebSocket 连接
  * ===================================================================== */
 
@@ -764,8 +863,8 @@ function attemptConnect(index) {
     if (attemptId !== connectAttempt) { c.end(); return; } // 已被更新的尝试取代
     client = c;
     setConnState('已连接 ' + url, 'connected');
-    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + '（此时运行 mqtt_publish.py 即可收到数据）');
-    c.subscribe(MQTT_TOPIC, { qos: 0 }, (err) => {
+    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + ' / ' + CONTROL_TOPIC + ' / ' + D5_TOPIC + '（此时运行 mqtt_publish.py 即可收到数据）');
+    c.subscribe([MQTT_TOPIC, CONTROL_TOPIC, D5_TOPIC], { qos: 0 }, (err) => {
       if (err) log('warn', '订阅失败: ' + err.message);
     });
   });
@@ -787,7 +886,11 @@ function attemptConnect(index) {
   c.on('reconnect', () => { if (attemptId === connectAttempt) setConnState('重连中…', 'reconnecting'); });
   c.on('offline', () => { if (attemptId === connectAttempt) setConnState('离线', 'disconnected'); });
   c.on('message', (topic, payload) => {
-    if (attemptId === connectAttempt) onMessageReceived(payload.toString());
+    if (attemptId !== connectAttempt) return;
+    // 按 topic 分流：控制主题 → 干预指令通道；数据主题 → 原有传感器管线（业务规则零改动）
+    if (topic === CONTROL_TOPIC) onControlReceived(payload.toString());
+    else if (topic === D5_TOPIC) onD5Received(payload.toString());
+    else onMessageReceived(payload.toString());
   });
 }
 

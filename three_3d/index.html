@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AirGuard E1 · 3D数字空间</title>
+<!--
+=====================================================================
+ AirGuard E1 — Three.js 3D 数字空间（three_3d/index.html）
+ 1. 3 个 3D 楼栋对象分别绑定 zone-n/zone-s/zone-w，物体颜色跟随 status 状态变化
+ 2. MQTT 消息实时更新无需刷新；D2 优先关注区域发光高亮；HANDLING 事件物体闪烁
+ 3. 交互：点击楼栋弹窗展示 zone 全部信息 + 镜头聚焦该楼栋
+
+ 【复用说明】
+   本页内嵌与 index.html【逐字一致】的后端逻辑层（computeStatus/D2打分/D3状态机/
+   去重排序管线/handleIntervention/getPriorityList），修改须四端同步。
+   各页面状态经 MQTT 收敛：数据主题 airguard/zones/all + 控制主题 airguard/zones/control。
+
+ 【CDN】mqtt.js@5 + three@0.147.0（UMD 版，含 examples/js 的最后版本，三脚本必须同版）
+   jsdelivr 主 + unpkg 备；CSS 手写；crowdLevel 来源一律 simulated（无 YOLO/图像检测）。
+
+ 【启动顺序】mosquitto 启动 → 双击本页 → py mqtt_publish.py 任一场景/stream
+=====================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --st-good: #0ca30c; --st-warning: #fab219; --st-serious: #ec835a; --st-critical: #d03b3b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; overflow: hidden; }
+.topbar { position: fixed; top: 0; left: 0; right: 0; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; background: rgba(13,13,13,.85); border-bottom: 1px solid var(--border); }
+.topbar h1 { font-size: 16px; margin: 0; }
+.topbar .sub { font-size: 11px; color: var(--ink-3); }
+#conn-badge { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+#conn-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+#conn-badge.connected .dot { background: var(--st-good); }
+#conn-badge.reconnecting .dot { background: var(--st-warning); }
+#conn-badge.disconnected .dot { background: var(--st-critical); }
+#scene-wrap { position: fixed; inset: 48px 0 0 0; }
+#labels { position: absolute; inset: 0; pointer-events: none; }
+.label { position: absolute; transform: translate(-50%, -100%); text-align: center; pointer-events: none; white-space: nowrap; }
+.label .l-name { display: inline-block; font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid; background: rgba(13,13,13,.8); }
+.label.zc-zone-n .l-name { color: var(--series-1); border-color: var(--series-1); }
+.label.zc-zone-s .l-name { color: var(--series-2); border-color: var(--series-2); }
+.label.zc-zone-w .l-name { color: var(--series-3); border-color: var(--series-3); }
+.label.no-data .l-name { color: var(--ink-3); border-color: var(--ink-3); }
+.label .l-badges { display: block; margin-top: 3px; }
+.label .top1 { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 999px; background: var(--st-warning); color: #1a1a19; font-weight: 600; }
+.label .review { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--st-warning); color: var(--st-warning); }
+.hidden { display: none !important; }
+#legend { position: absolute; left: 14px; bottom: 14px; z-index: 10; background: rgba(26,26,25,.9); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: var(--ink-2); }
+#legend .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+#legend .sw { width: 12px; height: 12px; border-radius: 3px; }
+#hint { position: absolute; right: 14px; bottom: 14px; z-index: 10; font-size: 11px; color: var(--ink-3); background: rgba(26,26,25,.9); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; }
+/* 弹窗 */
+#popup { position: absolute; right: 14px; top: 14px; z-index: 15; width: 320px; background: rgba(26,26,25,.95); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+#popup .pop-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+#popup .pop-close { background: none; border: 1px solid var(--border); color: var(--ink-2); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+#popup .pop-close:hover { color: var(--ink); }
+.pop-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,.06); font-size: 12px; }
+.pop-row .k { color: var(--ink-3); flex: none; }
+.pop-row .v { text-align: right; font-variant-numeric: tabular-nums; }
+.pop-sec { font-size: 11px; color: var(--ink-3); margin: 10px 0 4px; letter-spacing: 1px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid currentColor; background: rgba(255,255,255,.04); white-space: nowrap; }
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.st-good { color: var(--st-good); } .st-warning { color: var(--st-warning); }
+.st-serious { color: var(--st-serious); } .st-critical { color: var(--st-critical); }
+.zone-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.zc-zone-n { color: var(--series-1); border-color: var(--series-1); }
+.zc-zone-s { color: var(--series-2); border-color: var(--series-2); }
+.zc-zone-w { color: var(--series-3); border-color: var(--series-3); }
+.pop-empty { color: var(--ink-3); padding: 10px 0; font-size: 12px; }
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>AirGuard E1 · 3D数字空间</h1>
+      <div class="sub">3D 楼栋颜色跟随实时状态 · 优先关注发光 · HANDLING 闪烁 · 点击楼栋查看详情并聚焦</div>
+    </div>
+    <span id="conn-badge"><span class="dot"></span><span id="conn-text">连接中…</span></span>
+  </header>
+  <div id="scene-wrap">
+    <div id="labels"></div>
+    <div id="legend">
+      <div>楼体颜色 = 实时状态</div>
+      <div class="row"><span class="sw" style="background:var(--st-critical)"></span>重度污染</div>
+      <div class="row"><span class="sw" style="background:var(--st-serious)"></span>轻度污染</div>
+      <div class="row"><span class="sw" style="background:var(--st-warning)"></span>通风不足风险</div>
+      <div class="row"><span class="sw" style="background:var(--st-good)"></span>正常</div>
+      <div style="margin-top:6px">底座色带 = 区域身份 · 光环 = 优先关注</div>
+    </div>
+    <div id="hint">拖拽旋转 · 滚轮缩放 · 点击楼栋查看详情并聚焦</div>
+    <div id="popup" class="hidden">
+      <div class="pop-head"><span id="pop-title"></span><button class="pop-close" onclick="closePopup()">关闭</button></div>
+      <div id="pop-body"></div>
+    </div>
+  </div>
+
+<script>
+/* =====================================================================
+ * 【共享后端逻辑层】与 index.html 逐字保持一致，修改须四端同步
+ * ===================================================================== */
+
+const VALID_ZONES = ['zone-n', 'zone-s', 'zone-w'];
+const ZONE_NAMES = { 'zone-n': '宿舍区', 'zone-s': '教学区', 'zone-w': '食堂区' };
+
+const FLUSH_DELAY_MS = 300;
+const FLUSH_MAX_WAIT_MS = 1000;
+
+const STATUS_LABELS = { heavy: '重度污染', light: '轻度污染', vent: '通风不足风险', normal: '正常' };
+const ENV_WEIGHT = { heavy: 4, light: 3, vent: 2, normal: 1 };
+const STATUS_CSS = { heavy: 'st-critical', light: 'st-serious', vent: 'st-warning', normal: 'st-good' };
+const EVENT_STATUS_LABELS = { OPEN: '待处理', HANDLING: '处理中', RECOVERED: '已恢复' };
+const EVENT_STATUS_CSS = { OPEN: 'st-warning', HANDLING: 'st-serious', RECOVERED: 'st-good' };
+const LOG_TYPE_LABELS = { recv: '收到', dedup: '去重', late: '迟到', order: '排序', event: '事件', warn: '警告', info: '信息' };
+
+const MQTT_BROKER_CANDIDATES = ['ws://10.102.128.15:8083/mqtt', 'ws://127.0.0.1:8083/mqtt'];
+const MQTT_TOPIC = 'airguard/zones/all';
+const CONTROL_TOPIC = 'airguard/zones/control';  // 跨端干预指令主题（E3发布，四端订阅同步D3状态）
+
+function hashKeyStr(zoneId, timeStr) { return zoneId + '|' + timeStr; }
+
+function djb2(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) ^ str.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+const dedupHash = (zoneId, timeStr) => djb2(hashKeyStr(zoneId, timeStr));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+const fmt = n => Math.round(n);
+function fmtTime(ms) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); }
+function shortTime(iso) { return String(iso).slice(11, 19); }
+
+/* D1 核心：status 严格按顺序计算（禁止硬编码） */
+function computeStatus(pm25, co2) {
+  if (pm25 > 150) return 'heavy';
+  if (pm25 > 75) return 'light';
+  if (co2 >= 1500) return 'vent';
+  return 'normal';
+}
+function envWeightOf(statusCode) { return ENV_WEIGHT[statusCode]; }
+
+function needsReviewOf(msg) {
+  return msg.crowdSource === 'model' && !(typeof msg.confidence === 'number' && msg.confidence >= 0.6);
+}
+
+/* D2 核心：优先打分（独立函数，无 zoneId 分支） */
+function scorePriority(msg, status) {
+  const w = envWeightOf(status);
+  if (needsReviewOf(msg)) {
+    return {
+      score: w * 2,
+      needReview: true,
+      reason: '模型人群数据置信度' + (msg.confidence == null ? '缺失' : msg.confidence) +
+              ' < 0.6，标记需人工复核，crowdLevel=' + msg.crowdLevel + ' 不计分；' +
+              '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 = ' + (w * 2)
+    };
+  }
+  return {
+    score: w * 2 + msg.crowdLevel,
+    needReview: false,
+    reason: '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 + crowdLevel' +
+            msg.crowdLevel + ' = ' + (w * 2 + msg.crowdLevel)
+  };
+}
+
+function snapshot(msg, note) {
+  return {
+    time: msg.time,
+    pm25: msg.pm25,
+    co2: msg.co2,
+    crowdLevel: msg.crowdLevel,
+    status: computeStatus(msg.pm25, msg.co2),
+    note: note
+  };
+}
+
+function problemDescOf(status, msg) {
+  if (status === 'heavy') return '重度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'light') return '轻度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'vent') return '通风不足风险（CO2=' + msg.co2 + '）';
+  return '正常';
+}
+
+/* 每 zone 独立状态对象 —— 严格隔离，禁止串数据 */
+function newZoneState(zoneId) {
+  return {
+    zoneId: zoneId,
+    lastMsg: null,
+    lastProcessedTimeMs: -Infinity,
+    activeEventId: null,
+    events: [],
+    seenHashes: new Map(),
+    pendingQueue: [],
+    flushTimer: null,
+    flushFirstArrival: 0,
+    eventSeq: 0
+  };
+}
+
+function createZoneStates() {
+  const states = {};
+  VALID_ZONES.forEach(z => { states[z] = newZoneState(z); });
+  return states;
+}
+
+const state = createZoneStates();
+const originWeights = new Map();
+
+let arrivalSeqGlobal = 0;
+const backendLogs = [];
+function log(type, text) {
+  backendLogs.unshift({
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    type: type, text: text
+  });
+  if (backendLogs.length > 200) backendLogs.pop();
+}
+
+function activeEventOf(zone) {
+  if (!zone.activeEventId) return null;
+  return zone.events.find(e => e.event_id === zone.activeEventId) || null;
+}
+
+function latestEventOf(zone) {
+  if (!zone.events.length) return null;
+  return zone.events.reduce((a, b) =>
+    (Date.parse(b.startTime) > Date.parse(a.startTime) ? b : a), zone.events[0]);
+}
+
+function parseMsgPayload(raw) {
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return { ok: false, error: 'JSON解析失败: ' + e.message }; }
+  if (!data || typeof data !== 'object') return { ok: false, error: '报文不是JSON对象' };
+  if (!VALID_ZONES.includes(data.zoneId)) return { ok: false, error: '未知zoneId: ' + data.zoneId };
+  if (typeof data.pm25 !== 'number' || !isFinite(data.pm25)) return { ok: false, error: 'pm25非法' };
+  if (typeof data.co2 !== 'number' || !isFinite(data.co2)) return { ok: false, error: 'co2非法' };
+  let crowdLevel = data.crowdLevel;
+  if (typeof crowdLevel !== 'number' || !isFinite(crowdLevel)) crowdLevel = 0;
+  crowdLevel = Math.max(0, Math.min(3, Math.round(crowdLevel)));
+  const timeMs = Date.parse(data.time);
+  if (isNaN(timeMs)) return { ok: false, error: 'time非法: ' + data.time };
+  return {
+    ok: true,
+    msg: {
+      zoneId: data.zoneId,
+      pm25: data.pm25,
+      co2: data.co2,
+      crowdLevel: crowdLevel,
+      time: String(data.time),
+      timeMs: timeMs,
+      crowdSource: data.crowdSource,
+      confidence: data.confidence,
+      arrivalSeq: 0
+    }
+  };
+}
+
+function onMessageReceived(raw) {
+  const parsed = parseMsgPayload(raw);
+  if (!parsed.ok) { log('warn', '报文拒收: ' + parsed.error); return; }
+  const msg = parsed.msg;
+  const zone = state[msg.zoneId];
+  msg.arrivalSeq = ++arrivalSeqGlobal;
+
+  const h = dedupHash(msg.zoneId, msg.time);
+  if (zone.seenHashes.has(h)) {
+    log('dedup', msg.zoneId + ' 重复消息丢弃 (hash=' + h + ', time=' + shortTime(msg.time) + ')');
+    return;
+  }
+  zone.seenHashes.set(h, Date.now());
+
+  log('recv', msg.zoneId + ' 收到报文 pm25=' + msg.pm25 + ' co2=' + msg.co2 +
+      ' crowd=' + msg.crowdLevel + ' time=' + msg.time);
+  zone.pendingQueue.push(msg);
+  scheduleFlush(zone);
+}
+
+function scheduleFlush(zone) {
+  if (zone.flushFirstArrival === 0) zone.flushFirstArrival = Date.now();
+  if (zone.flushTimer) clearTimeout(zone.flushTimer);
+  const waited = Date.now() - zone.flushFirstArrival;
+  const delay = Math.max(0, Math.min(FLUSH_DELAY_MS, FLUSH_MAX_WAIT_MS - waited));
+  zone.flushTimer = setTimeout(() => flushZone(zone), delay);
+}
+
+function flushZone(zone) {
+  zone.flushTimer = null;
+  zone.flushFirstArrival = 0;
+  if (!zone.pendingQueue.length) return;
+  zone.pendingQueue.sort((a, b) => (a.timeMs - b.timeMs) || (a.arrivalSeq - b.arrivalSeq));
+  const batch = zone.pendingQueue.splice(0);
+  if (batch.length > 1) {
+    log('order', zone.zoneId + ' 乱序重排: ' + batch.map(m => shortTime(m.time)).join(' → '));
+  }
+  batch.forEach(m => processOne(zone, m));
+  render();
+}
+
+function processOne(zone, msg) {
+  if (msg.timeMs <= zone.lastProcessedTimeMs) { handleLate(zone, msg); return; }
+  applyMessage(zone, msg);
+}
+
+function handleLate(zone, msg) {
+  const ev = latestEventOf(zone);
+  if (ev) {
+    ev.verifyDataList.push(snapshot(msg, '迟到消息（旧时间戳）：仅追加历史，不参与状态判定'));
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ') → 仅追加到事件 ' +
+        ev.event_id + ' 的 verifyDataList 历史');
+  } else {
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ')：该区域无事件记录，仅记日志');
+  }
+}
+
+function applyMessage(zone, msg) {
+  zone.lastMsg = msg;
+  zone.lastProcessedTimeMs = msg.timeMs;
+  const status = computeStatus(msg.pm25, msg.co2);
+  if (status === 'normal') handleNormal(zone, msg, status);
+  else handleAbnormal(zone, msg, status, envWeightOf(status));
+}
+
+/* ---------- D3 事件状态机 ---------- */
+
+function handleNormal(zone, msg, status) {
+  const ev = activeEventOf(zone);
+  if (!ev) return;
+  if (ev.eventStatus === 'HANDLING') {
+    recoverEvent(zone, ev, msg, status);
+  } else if (ev.eventStatus === 'OPEN') {
+    ev.verifyDataList.push(snapshot(msg, '正常快照：事件保持 OPEN，等待人工点击【执行干预】'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到正常数据但状态为 OPEN，保持待处理');
+  }
+}
+
+function handleAbnormal(zone, msg, status, w) {
+  const ev = activeEventOf(zone);
+  if (!ev) { createEvent(zone, msg, status, w); return; }
+  if (ev.eventStatus === 'OPEN') {
+    ev.problemDesc = problemDescOf(status, msg);
+    ev.verifyDataList.push(snapshot(msg, '持续异常快照：事件保持 OPEN'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 持续异常，保持 OPEN');
+  } else if (ev.eventStatus === 'HANDLING') {
+    const w0 = originWeights.get(ev.event_id) || 1;
+    if (w >= w0) {
+      rollbackToOpen(zone, ev, msg, status, w, w0);
+    } else {
+      ev.verifyDataList.push(snapshot(msg, '好转但仍异常（严重度' + w + ' < 创建时' + w0 + '）：保持 HANDLING'));
+      log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 好转但仍异常，保持 HANDLING');
+    }
+  }
+}
+
+function createEvent(zone, msg, status, w) {
+  zone.eventSeq += 1;
+  const event_id = 'EVT-' + zone.zoneId + '-' + zone.eventSeq;
+  const ev = {
+    event_id: event_id,
+    zoneId: zone.zoneId,
+    startTime: msg.time,
+    problemDesc: problemDescOf(status, msg),
+    priorityReason: scorePriority(msg, status).reason,
+    userAction: '',
+    verifyDataList: [snapshot(msg, '创建事件快照：检测到异常')],
+    eventStatus: 'OPEN',
+    recoverTime: null
+  };
+  originWeights.set(event_id, w);
+  zone.events.push(ev);
+  zone.activeEventId = event_id;
+  log('event', zone.zoneId + ' 新建事件 ' + event_id + ' [' + STATUS_LABELS[status] + ']，状态=OPEN');
+}
+
+function recoverEvent(zone, ev, msg, status) {
+  ev.eventStatus = 'RECOVERED';
+  ev.recoverTime = msg.time;
+  ev.verifyDataList.push(snapshot(msg, '恢复快照：新消息指标满足恢复条件（正常），HANDLING→RECOVERED'));
+  zone.activeEventId = null;
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到后续新数据满足恢复条件：HANDLING→RECOVERED');
+}
+
+function rollbackToOpen(zone, ev, msg, status, w, w0) {
+  ev.eventStatus = 'OPEN';
+  ev.problemDesc = problemDescOf(status, msg);
+  ev.verifyDataList.push(snapshot(msg, '恶化回退快照：新数据严重度' + w + ' >= 创建时' + w0 + '，HANDLING 回退 OPEN'));
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 指标恶化（严重度' + w + '>=' + w0 + '）：HANDLING→OPEN');
+}
+
+function handleIntervention(zoneId) {
+  const zone = state[zoneId];
+  const ev = activeEventOf(zone);
+  if (!ev || ev.eventStatus !== 'OPEN') {
+    log('warn', zoneId + ' 干预操作无效：当前无 OPEN 状态的活动事件');
+    return;
+  }
+  ev.eventStatus = 'HANDLING';
+  ev.userAction = '人工点击【执行干预】按钮（' + new Date().toLocaleString('zh-CN', { hour12: false }) + '）';
+  log('event', zoneId + ' 事件 ' + ev.event_id + ' 人工干预：OPEN→HANDLING');
+  render();
+}
+
+/** 控制主题指令处理（E3 等页面发布【执行干预】指令，跨端同步 D3 状态）。 */
+function onControlReceived(raw) {
+  let cmd;
+  try { cmd = JSON.parse(raw); } catch (e) { log('warn', '控制指令解析失败: ' + e.message); return; }
+  if (!cmd || !VALID_ZONES.includes(cmd.zoneId) || cmd.action !== 'intervene') {
+    log('warn', '非法控制指令丢弃: ' + raw);
+    return;
+  }
+  log('event', '收到控制指令（远端页面）：' + cmd.zoneId + ' 执行干预');
+  handleIntervention(cmd.zoneId);
+}
+
+function getPriorityList() {
+  const rows = [];
+  VALID_ZONES.forEach(zoneId => {
+    const zone = state[zoneId];
+    if (!zone.lastMsg) return;
+    const status = computeStatus(zone.lastMsg.pm25, zone.lastMsg.co2);
+    const p = scorePriority(zone.lastMsg, status);
+    rows.push({
+      zoneId: zoneId, zoneName: ZONE_NAMES[zoneId], status: status,
+      score: p.score, reason: p.reason, needReview: p.needReview
+    });
+  });
+  rows.sort((a, b) => b.score - a.score);
+  return rows;
+}
+
+/* =====================================================================
+ * E1 3D 场景层（Three.js @0.147.0 UMD）
+ * ===================================================================== */
+
+// 状态色与身份色（hex，供 3D 材质使用，与 CSS 变量一致）
+const STATUS_HEX = { heavy: '#d03b3b', light: '#ec835a', vent: '#fab219', normal: '#0ca30c' };
+const ZONE_HEX = { 'zone-n': '#3987e5', 'zone-s': '#d95926', 'zone-w': '#199e70' };
+// 楼栋布局：位置与高度（按 zone 错开，提高可辨识度）
+const BUILDING_LAYOUT = { 'zone-n': { x: -5, h: 5.0 }, 'zone-s': { x: 0, h: 3.6 }, 'zone-w': { x: 5, h: 4.4 } };
+
+let scene, camera, renderer, controls, raycaster;
+let pointerDown = null, focusAnim = null, popupZoneId = null, lastTs = 0;
+const buildings = {};   // zoneId -> { group, body, bodyMat, cap, capMat, ring, ringMat, center, topY, labelEl, top1El, reviewEl, blink, glow }
+
+const wrap = document.getElementById('scene-wrap');
+const labelsWrap = document.getElementById('labels');
+const popupEl = document.getElementById('popup');
+
+function initThree() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d0d0d);
+  camera = new THREE.PerspectiveCamera(45, wrap.clientWidth / wrap.clientHeight, 0.1, 200);
+  camera.position.set(10, 7, 14);
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+  } catch (e) {
+    setConnState('WebGL 不可用', 'disconnected');
+    log('warn', 'WebGLRenderer 创建失败（无GPU环境）：' + e.message);
+    return;
+  }
+  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;   // r147 命名（r152 起才改 outputColorSpace）
+  wrap.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  dirLight.position.set(8, 12, 6);
+  scene.add(dirLight);
+  const grid = new THREE.GridHelper(30, 30, 0x2c2c2a, 0x1f1f1e);
+  grid.position.y = -0.01;
+  scene.add(grid);
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 2, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 4;
+  controls.maxDistance = 40;
+  controls.maxPolarAngle = Math.PI * 0.48;
+
+  buildBuildings();
+  initSceneEvents();
+  requestAnimationFrame(animLoop);
+}
+
+/** 构建三栋楼：主 Box（体色=状态色）+ 顶部退台 + 底座身份色带 + 优先发光光环 */
+function buildBuildings() {
+  VALID_ZONES.forEach(zoneId => {
+    const layout = BUILDING_LAYOUT[zoneId];
+    const w = 2.2, d = 2.2, h = layout.h;
+    const group = new THREE.Group();
+
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.55, metalness: 0.1, emissive: 0x000000 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), bodyMat);
+    body.position.y = h / 2;
+
+    const capMat = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.5, metalness: 0.1 });
+    const cap = new THREE.Mesh(new THREE.BoxGeometry(w * 0.62, 0.5, d * 0.62), capMat);
+    cap.position.y = h + 0.25;
+
+    const bandMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(ZONE_HEX[zoneId]), roughness: 0.4,
+      emissive: new THREE.Color(ZONE_HEX[zoneId]), emissiveIntensity: 0.35
+    });
+    const band = new THREE.Mesh(new THREE.BoxGeometry(w * 1.12, 0.35, d * 1.12), bandMat);
+    band.position.y = 0.175;
+
+    // 优先关注发光光环（初始隐藏，D2 最高分时可见脉动）
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(ZONE_HEX[zoneId]), transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide
+    });
+    const ring = new THREE.Mesh(new THREE.RingGeometry(w * 0.55, w * 0.85, 40), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+
+    group.add(body, cap, band, ring);
+    group.position.x = layout.x;
+    group.userData.zoneId = zoneId;
+    body.userData.zoneId = zoneId;
+    cap.userData.zoneId = zoneId;
+    band.userData.zoneId = zoneId;
+    scene.add(group);
+
+    // HTML 覆盖层标签（每帧 project() 定位）
+    const labelEl = document.createElement('div');
+    labelEl.className = 'label zc-' + zoneId;
+    labelEl.innerHTML = '<span class="l-name">' + zoneId + ' · ' + ZONE_NAMES[zoneId] + '</span>' +
+      '<span class="l-badges"><span class="top1 hidden">TOP1 优先关注</span> <span class="review hidden">需人工复核</span></span>';
+    labelsWrap.appendChild(labelEl);
+
+    buildings[zoneId] = {
+      group, body, bodyMat, cap, capMat, ring, ringMat,
+      center: new THREE.Vector3(layout.x, h / 2, 0),
+      topY: h + 0.75,
+      labelEl, top1El: labelEl.querySelector('.top1'), reviewEl: labelEl.querySelector('.review'),
+      blink: false, glow: false
+    };
+  });
+}
+
+/** E1 版 render()：由 flushZone/handleIntervention 自动调用，幂等增量更新，不重建场景 */
+function render() { updateBuildingsFromState(); }
+
+function updateBuildingsFromState() {
+  const priorityList = getPriorityList();
+  const topZone = priorityList.length ? priorityList[0].zoneId : null;
+  VALID_ZONES.forEach(zoneId => {
+    const b = buildings[zoneId];
+    const zone = state[zoneId];
+    const msg = zone.lastMsg;
+    if (!msg) {
+      b.bodyMat.color.set('#555555');
+      b.capMat.color.set('#444444');
+      b.bodyMat.emissive.set('#000000');
+      b.labelEl.classList.add('no-data');
+      b.blink = false; b.glow = false;
+      b.top1El.classList.add('hidden'); b.reviewEl.classList.add('hidden');
+      return;
+    }
+    const status = computeStatus(msg.pm25, msg.co2);
+    const hex = STATUS_HEX[status];
+    b.bodyMat.color.set(hex);                    // 物体颜色跟随 status
+    b.capMat.color.set(hex).multiplyScalar(0.72);
+    b.bodyMat.emissive.set(hex);
+    b.labelEl.classList.remove('no-data');
+    // HANDLING 状态物体闪烁（活动事件）
+    const ev = activeEventOf(zone);
+    b.blink = !!(ev && ev.eventStatus === 'HANDLING');
+    // D2 优先关注区域发光高亮
+    b.glow = (topZone === zoneId);
+    b.top1El.classList.toggle('hidden', !b.glow);
+    b.reviewEl.classList.toggle('hidden', !needsReviewOf(msg));
+  });
+  if (popupZoneId) refreshPopup();
+}
+
+/** 主循环：闪烁/发光动画 → 标签投影 → 镜头聚焦 lerp → 渲染 */
+function animLoop(ts) {
+  const dt = Math.min(0.1, (ts - lastTs) / 1000) || 0.016;
+  lastTs = ts;
+  const t = ts / 1000;
+  VALID_ZONES.forEach(zoneId => {
+    const b = buildings[zoneId];
+    if (b.blink) {
+      b.bodyMat.emissiveIntensity = 0.5 + 0.5 * Math.abs(Math.sin(t * 4));       // HANDLING 闪烁
+    } else if (b.glow) {
+      b.bodyMat.emissiveIntensity = 0.35 + 0.15 * Math.sin(t * 2.5);             // 优先区增强发光
+    } else {
+      b.bodyMat.emissiveIntensity = 0.18;
+    }
+    if (b.glow) {
+      b.ring.visible = true;
+      b.ringMat.opacity = 0.35 + 0.25 * Math.abs(Math.sin(t * 2.5));             // 地面光环脉动
+    } else {
+      b.ring.visible = false;
+    }
+  });
+  updateLabelPositions();
+  updateFocus(dt);
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animLoop);
+}
+
+/** HTML 标签：3D 坐标投影到屏幕（相机后方隐藏） */
+function updateLabelPositions() {
+  VALID_ZONES.forEach(zoneId => {
+    const b = buildings[zoneId];
+    const v = new THREE.Vector3(b.center.x, b.topY + 0.6, b.center.z);
+    v.project(camera);
+    if (v.z > 1 || Math.abs(v.x) > 1.1 || Math.abs(v.y) > 1.1) {
+      b.labelEl.style.display = 'none';
+      return;
+    }
+    b.labelEl.style.display = '';
+    b.labelEl.style.left = ((v.x * 0.5 + 0.5) * wrap.clientWidth) + 'px';
+    b.labelEl.style.top = ((-v.y * 0.5 + 0.5) * wrap.clientHeight) + 'px';
+  });
+}
+
+/** 镜头聚焦：指数阻尼插值（无 tween 库），保持当前视角方向，动画期禁用 controls */
+function startFocus(zoneId) {
+  const b = buildings[zoneId];
+  const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+  const target = b.center.clone().add(new THREE.Vector3(0, 1.2, 0));
+  const dist = 6.5;
+  focusAnim = { pos: target.clone().addScaledVector(dir, dist), target: target, t: 0 };
+  controls.enabled = false;
+}
+
+function updateFocus(dt) {
+  if (!focusAnim) return;
+  focusAnim.t += dt;
+  const k = 1 - Math.exp(-5 * dt);   // 帧率无关阻尼系数
+  camera.position.lerp(focusAnim.pos, k);
+  controls.target.lerp(focusAnim.target, k);
+  if (camera.position.distanceTo(focusAnim.pos) < 0.08 || focusAnim.t > 2) {
+    focusAnim = null;
+    controls.enabled = true;
+  }
+}
+
+/** 事件：resize + 点击拾取（位移 <5px 才算点击，避免 OrbitControls 拖拽误触） */
+function initSceneEvents() {
+  raycaster = new THREE.Raycaster();
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    pointerDown = { x: e.clientX, y: e.clientY };
+  });
+  renderer.domElement.addEventListener('pointerup', (e) => {
+    if (!pointerDown) return;
+    const moved = Math.hypot(e.clientX - pointerDown.x, e.clientY - pointerDown.y);
+    pointerDown = null;
+    if (moved > 5) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    raycaster.setFromCamera(ndc, camera);
+    const hits = raycaster.intersectObjects(scene.children, true)
+      .filter(h => h.object.userData.zoneId);
+    if (hits.length) {
+      const zoneId = hits[0].object.userData.zoneId;
+      openPopup(zoneId);      // 弹窗展示 zone 全部信息
+      startFocus(zoneId);     // 镜头聚焦该楼栋
+    }
+  });
+  window.addEventListener('resize', () => {
+    camera.aspect = wrap.clientWidth / wrap.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  });
+}
+
+/* ---------- 弹窗（展示 zone 全部信息，内容全部来自运行时 state） ---------- */
+
+function statusBadgeHtml(statusCode) {
+  return '<span class="badge ' + STATUS_CSS[statusCode] + '"><span class="dot"></span>' +
+         STATUS_LABELS[statusCode] + '</span>';
+}
+
+function openPopup(zoneId) {
+  popupZoneId = zoneId;
+  popupEl.classList.remove('hidden');
+  refreshPopup();
+}
+
+function closePopup() {
+  popupZoneId = null;
+  popupEl.classList.add('hidden');
+}
+
+function refreshPopup() {
+  const zoneId = popupZoneId;
+  const zone = state[zoneId];
+  const msg = zone.lastMsg;
+  document.getElementById('pop-title').innerHTML =
+    '<span class="zone-chip zc-' + zoneId + '">' + zoneId + ' · ' + ZONE_NAMES[zoneId] + '</span>';
+  const body = document.getElementById('pop-body');
+  if (!msg) {
+    body.innerHTML = '<div class="pop-empty">该区域暂无数据，请先运行 mqtt_publish.py 场景或 stream 持续上报。</div>';
+    return;
+  }
+  const status = computeStatus(msg.pm25, msg.co2);
+  const p = scorePriority(msg, status);
+  const ev = activeEventOf(zone);
+  let html = '';
+  html += '<div class="pop-sec">实时指标</div>';
+  html += popRow('PM2.5', fmt(msg.pm25));
+  html += popRow('CO₂', fmt(msg.co2));
+  html += popRow('人流等级', msg.crowdLevel);
+  html += popRow('状态', statusBadgeHtml(status));
+  html += popRow('更新时间', fmtTime(msg.timeMs));
+  html += '<div class="pop-sec">D2 优先关注</div>';
+  html += popRow('优先分数', p.score + ' 分' + (p.needReview ? '（需人工复核，crowdLevel 不计分）' : ''));
+  html += '<div class="pop-row"><span class="k">判断理由</span><span class="v" style="max-width:200px">' +
+          escapeHtml(p.reason) + '</span></div>';
+  html += '<div class="pop-sec">D3 事件状态机</div>';
+  if (ev) {
+    html += popRow('事件ID', escapeHtml(ev.event_id));
+    html += popRow('状态', '<span class="badge ' + EVENT_STATUS_CSS[ev.eventStatus] +
+            '"><span class="dot"></span>' + EVENT_STATUS_LABELS[ev.eventStatus] + '</span>');
+    html += popRow('开始时间', fmtTime(Date.parse(ev.startTime)));
+    html += popRow('问题描述', escapeHtml(ev.problemDesc));
+    html += popRow('人工操作', escapeHtml(ev.userAction || '—'));
+    if (ev.recoverTime) html += popRow('恢复时间', fmtTime(Date.parse(ev.recoverTime)));
+  } else {
+    html += '<div class="pop-empty">当前无活动事件</div>';
+  }
+  body.innerHTML = html;
+}
+
+function popRow(k, v) {
+  return '<div class="pop-row"><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
+}
+
+/* =====================================================================
+ * MQTT 连接（候选地址回退 + 数据/控制双主题）
+ * ===================================================================== */
+
+let client = null;
+let connectAttempt = 0;
+
+function setConnState(text, cls) {
+  const badge = document.getElementById('conn-badge');
+  document.getElementById('conn-text').textContent = text;
+  badge.className = cls || '';
+}
+
+function initMqtt() { attemptConnect(0); }
+
+function attemptConnect(index) {
+  const url = MQTT_BROKER_CANDIDATES[index % MQTT_BROKER_CANDIDATES.length];
+  const attemptId = ++connectAttempt;
+  setConnState('连接中 ' + url + ' …', 'reconnecting');
+  log('info', '尝试连接 ' + url + ' …');
+  const c = mqtt.connect(url, {
+    clientId: 'airguard-e1-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 2000,
+    connectTimeout: 4000,
+    keepalive: 30,
+    path: '/mqtt'
+  });
+  let connected = false;
+  c.on('connect', () => {
+    connected = true;
+    if (attemptId !== connectAttempt) { c.end(); return; }
+    client = c;
+    setConnState('已连接 ' + url, 'connected');
+    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + ' / ' + CONTROL_TOPIC);
+    c.subscribe([MQTT_TOPIC, CONTROL_TOPIC], { qos: 0 }, (err) => {
+      if (err) log('warn', '订阅失败: ' + err.message);
+    });
+  });
+  c.on('error', (e) => {
+    if (attemptId !== connectAttempt) return;
+    if (connected) {
+      setConnState('连接错误', 'disconnected');
+      log('warn', 'MQTT错误: ' + (e && e.message ? e.message : e));
+      return;
+    }
+    log('warn', '连接 ' + url + ' 失败（' + (e && e.message ? e.message : e) + '），切换下一候选');
+    c.end(true);
+    attemptConnect(index + 1);
+  });
+  c.on('close', () => {
+    if (attemptId === connectAttempt && connected) setConnState('已断开', 'disconnected');
+  });
+  c.on('reconnect', () => { if (attemptId === connectAttempt) setConnState('重连中…', 'reconnecting'); });
+  c.on('offline', () => { if (attemptId === connectAttempt) setConnState('离线', 'disconnected'); });
+  c.on('message', (topic, payload) => {
+    if (attemptId !== connectAttempt) return;
+    if (topic === CONTROL_TOPIC) onControlReceived(payload.toString());
+    else onMessageReceived(payload.toString());
+  });
+}
+
+/* =====================================================================
+ * 启动：CDN 回退链（mqtt.js 阻塞加载；three.js 顺序加载回退链）
+ * ===================================================================== */
+
+function loadScript(src, onload, onerror) {
+  const s = document.createElement('script');
+  s.src = src;
+  s.onload = onload;
+  s.onerror = onerror;
+  document.head.appendChild(s);
+}
+
+function bootThree() {
+  loadScript('https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js', () => {
+    loadScript('https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js',
+      initApp, () => bootThreeUnpkg(1));
+  }, () => bootThreeUnpkg(0));
+}
+
+function bootThreeUnpkg(stage) {
+  if (stage === 0) {
+    loadScript('https://unpkg.com/three@0.147.0/build/three.min.js', () => {
+      loadScript('https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js', initApp, threeFail);
+    }, threeFail);
+  } else {
+    loadScript('https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js', initApp, threeFail);
+  }
+}
+
+function threeFail() {
+  setConnState('Three.js CDN 加载失败', 'disconnected');
+  log('warn', 'Three.js 两个公开 CDN 均加载失败，请检查网络');
+}
+
+function initApp() {
+  log('info', 'E1 3D数字空间初始化完成');
+  initThree();
+  render();
+  initMqtt();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (window.mqtt) {
+    bootThree();
+  } else {
+    loadScript('https://unpkg.com/mqtt@5/dist/mqtt.min.js', bootThree, () => {
+      setConnState('mqtt.js CDN 加载失败', 'disconnected');
+      log('warn', 'mqtt.js 两个公开 CDN 均加载失败，请检查网络');
+    });
+  }
+});
+</script>
+</body>
+</html>

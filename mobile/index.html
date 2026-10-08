@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AirGuard E3 · 移动端</title>
+<!--
+=====================================================================
+ AirGuard E3 — 移动端 H5（mobile/index.html）
+ 1. 订阅与 Web 监测台完全相同的 MQTT-WebSocket（airguard/zones/all），同源数据，
+    禁止两端手动输入模拟同步 —— 本页无任何数据输入框，数据只来自 MQTT 订阅。
+ 2. 简化界面：zone 切换 + 核心指标 + 事件状态 + 更新时间（不复制完整监测台）。
+ 3. 【执行干预】按钮：点击后经控制主题 airguard/zones/control 发布指令
+    {"zoneId","action":"intervene","time":ISO}，驱动 D3 状态流转（OPEN→HANDLING）；
+    Web监测台 / E1 3D页面 / 本页经同一指令回环收敛，必须同步看到事件状态变更。
+
+ 【复用说明】本页内嵌与 index.html【逐字一致】的后端逻辑层（D1/D2/D3 状态机/
+   去重排序管线），修改须四端同步。仅活动事件为 OPEN 时按钮可用（规则2）。
+ 【CDN】仅 mqtt.js@5（jsdelivr 主 + unpkg 备）；CSS 手写，移动优先。
+=====================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --st-good: #0ca30c; --st-warning: #fab219; --st-serious: #ec835a; --st-critical: #d03b3b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; }
+.wrap { max-width: 480px; margin: 0 auto; padding: 12px 14px 40px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+h1 { font-size: 16px; margin: 0; }
+.sub { color: var(--ink-3); font-size: 11px; }
+#conn-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-2); padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+#conn-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+#conn-badge.connected .dot { background: var(--st-good); }
+#conn-badge.reconnecting .dot { background: var(--st-warning); }
+#conn-badge.disconnected .dot { background: var(--st-critical); }
+.zone-tabs { display: flex; gap: 8px; margin-top: 12px; }
+.zone-tabs button { flex: 1; background: transparent; border: 1px solid var(--border); color: var(--ink-2); border-radius: 10px; padding: 10px 0; font-size: 13px; cursor: pointer; min-height: 44px; }
+.zone-tabs button.active { color: #fff; }
+.zone-tabs button.zc-zone-n.active { background: var(--series-1); border-color: var(--series-1); }
+.zone-tabs button.zc-zone-s.active { background: var(--series-2); border-color: var(--series-2); }
+.zone-tabs button.zc-zone-w.active { background: var(--series-3); border-color: var(--series-3); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 12px; }
+.card h2 { font-size: 12px; color: var(--ink-2); margin: 0 0 10px; letter-spacing: 1px; }
+.card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 12px; border-radius: 999px; border: 1px solid currentColor; background: rgba(255,255,255,.04); white-space: nowrap; }
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.st-good { color: var(--st-good); } .st-warning { color: var(--st-warning); }
+.st-serious { color: var(--st-serious); } .st-critical { color: var(--st-critical); }
+.stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.stat { background: rgba(255,255,255,.03); border: 1px solid var(--border); border-radius: 10px; padding: 12px 6px; text-align: center; }
+.stat-label { font-size: 11px; color: var(--ink-3); }
+.stat-value { font-size: 24px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.row { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,.06); font-size: 12px; }
+.row .k { color: var(--ink-3); flex: none; }
+.row .v { text-align: right; font-variant-numeric: tabular-nums; }
+details { margin-top: 6px; }
+summary { font-size: 12px; color: var(--ink-2); cursor: pointer; padding: 6px 0; }
+.empty { color: var(--ink-3); text-align: center; padding: 18px 0; font-size: 12px; }
+#btn-intervene {
+  display: block; width: 100%; margin-top: 12px; min-height: 52px;
+  background: var(--series-1); color: #fff; border: none; border-radius: 12px;
+  font-size: 16px; font-weight: 600; cursor: pointer;
+}
+#btn-intervene:hover { filter: brightness(1.12); }
+#btn-intervene:disabled { background: rgba(255,255,255,.08); color: var(--ink-3); cursor: not-allowed; font-weight: 400; }
+#toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 10px 18px; font-size: 13px; z-index: 50; transition: opacity .3s; opacity: 0; pointer-events: none; max-width: 90vw; text-align: center; }
+#log-panel { max-height: 160px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+.log-line { padding: 2px 0; border-bottom: 1px dashed rgba(255,255,255,.05); }
+.log-time { color: var(--ink-3); margin-right: 8px; }
+.log-recv { color: var(--ink-2); } .log-info { color: var(--ink-3); }
+.log-dedup { color: var(--st-warning); } .log-late { color: var(--st-warning); }
+.log-order { color: var(--series-1); } .log-event { color: var(--series-3); } .log-warn { color: var(--st-critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>AirGuard E3 · 移动端</h1>
+      <div class="sub">与 Web 监测台同源 MQTT 数据 · 控制主题驱动 D3 状态流转</div>
+    </div>
+    <span id="conn-badge"><span class="dot"></span><span id="conn-text">连接中…</span></span>
+  </header>
+
+  <div class="zone-tabs" id="zone-tabs"></div>
+
+  <section class="card">
+    <div class="card-head" id="zone-head"></div>
+    <div id="zone-card"></div>
+  </section>
+
+  <section class="card">
+    <h2>活动事件（D3 状态机）</h2>
+    <div id="event-block"></div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>最近事件与运行日志（取证用）</summary>
+      <div id="history"></div>
+      <div id="log-panel" style="margin-top:8px"></div>
+    </details>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+/* =====================================================================
+ * 【共享后端逻辑层】与 index.html 逐字保持一致，修改须四端同步
+ * ===================================================================== */
+
+const VALID_ZONES = ['zone-n', 'zone-s', 'zone-w'];
+const ZONE_NAMES = { 'zone-n': '宿舍区', 'zone-s': '教学区', 'zone-w': '食堂区' };
+
+const FLUSH_DELAY_MS = 300;
+const FLUSH_MAX_WAIT_MS = 1000;
+
+const STATUS_LABELS = { heavy: '重度污染', light: '轻度污染', vent: '通风不足风险', normal: '正常' };
+const ENV_WEIGHT = { heavy: 4, light: 3, vent: 2, normal: 1 };
+const STATUS_CSS = { heavy: 'st-critical', light: 'st-serious', vent: 'st-warning', normal: 'st-good' };
+const EVENT_STATUS_LABELS = { OPEN: '待处理', HANDLING: '处理中', RECOVERED: '已恢复' };
+const EVENT_STATUS_CSS = { OPEN: 'st-warning', HANDLING: 'st-serious', RECOVERED: 'st-good' };
+const LOG_TYPE_LABELS = { recv: '收到', dedup: '去重', late: '迟到', order: '排序', event: '事件', warn: '警告', info: '信息' };
+
+const MQTT_BROKER_CANDIDATES = ['ws://10.102.128.15:8083/mqtt', 'ws://127.0.0.1:8083/mqtt'];
+const MQTT_TOPIC = 'airguard/zones/all';
+const CONTROL_TOPIC = 'airguard/zones/control';
+
+function hashKeyStr(zoneId, timeStr) { return zoneId + '|' + timeStr; }
+
+function djb2(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) ^ str.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+const dedupHash = (zoneId, timeStr) => djb2(hashKeyStr(zoneId, timeStr));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+const fmt = n => Math.round(n);
+function fmtTime(ms) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); }
+function shortTime(iso) { return String(iso).slice(11, 19); }
+
+function computeStatus(pm25, co2) {
+  if (pm25 > 150) return 'heavy';
+  if (pm25 > 75) return 'light';
+  if (co2 >= 1500) return 'vent';
+  return 'normal';
+}
+function envWeightOf(statusCode) { return ENV_WEIGHT[statusCode]; }
+
+function needsReviewOf(msg) {
+  return msg.crowdSource === 'model' && !(typeof msg.confidence === 'number' && msg.confidence >= 0.6);
+}
+
+function scorePriority(msg, status) {
+  const w = envWeightOf(status);
+  if (needsReviewOf(msg)) {
+    return {
+      score: w * 2,
+      needReview: true,
+      reason: '模型人群数据置信度' + (msg.confidence == null ? '缺失' : msg.confidence) +
+              ' < 0.6，标记需人工复核，crowdLevel=' + msg.crowdLevel + ' 不计分；' +
+              '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 = ' + (w * 2)
+    };
+  }
+  return {
+    score: w * 2 + msg.crowdLevel,
+    needReview: false,
+    reason: '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 + crowdLevel' +
+            msg.crowdLevel + ' = ' + (w * 2 + msg.crowdLevel)
+  };
+}
+
+function snapshot(msg, note) {
+  return {
+    time: msg.time,
+    pm25: msg.pm25,
+    co2: msg.co2,
+    crowdLevel: msg.crowdLevel,
+    status: computeStatus(msg.pm25, msg.co2),
+    note: note
+  };
+}
+
+function problemDescOf(status, msg) {
+  if (status === 'heavy') return '重度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'light') return '轻度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'vent') return '通风不足风险（CO2=' + msg.co2 + '）';
+  return '正常';
+}
+
+function newZoneState(zoneId) {
+  return {
+    zoneId: zoneId,
+    lastMsg: null,
+    lastProcessedTimeMs: -Infinity,
+    activeEventId: null,
+    events: [],
+    seenHashes: new Map(),
+    pendingQueue: [],
+    flushTimer: null,
+    flushFirstArrival: 0,
+    eventSeq: 0
+  };
+}
+
+function createZoneStates() {
+  const states = {};
+  VALID_ZONES.forEach(z => { states[z] = newZoneState(z); });
+  return states;
+}
+
+const state = createZoneStates();
+const originWeights = new Map();
+
+let arrivalSeqGlobal = 0;
+const backendLogs = [];
+function log(type, text) {
+  backendLogs.unshift({
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    type: type, text: text
+  });
+  if (backendLogs.length > 200) backendLogs.pop();
+}
+
+function activeEventOf(zone) {
+  if (!zone.activeEventId) return null;
+  return zone.events.find(e => e.event_id === zone.activeEventId) || null;
+}
+
+function latestEventOf(zone) {
+  if (!zone.events.length) return null;
+  return zone.events.reduce((a, b) =>
+    (Date.parse(b.startTime) > Date.parse(a.startTime) ? b : a), zone.events[0]);
+}
+
+function parseMsgPayload(raw) {
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return { ok: false, error: 'JSON解析失败: ' + e.message }; }
+  if (!data || typeof data !== 'object') return { ok: false, error: '报文不是JSON对象' };
+  if (!VALID_ZONES.includes(data.zoneId)) return { ok: false, error: '未知zoneId: ' + data.zoneId };
+  if (typeof data.pm25 !== 'number' || !isFinite(data.pm25)) return { ok: false, error: 'pm25非法' };
+  if (typeof data.co2 !== 'number' || !isFinite(data.co2)) return { ok: false, error: 'co2非法' };
+  let crowdLevel = data.crowdLevel;
+  if (typeof crowdLevel !== 'number' || !isFinite(crowdLevel)) crowdLevel = 0;
+  crowdLevel = Math.max(0, Math.min(3, Math.round(crowdLevel)));
+  const timeMs = Date.parse(data.time);
+  if (isNaN(timeMs)) return { ok: false, error: 'time非法: ' + data.time };
+  return {
+    ok: true,
+    msg: {
+      zoneId: data.zoneId,
+      pm25: data.pm25,
+      co2: data.co2,
+      crowdLevel: crowdLevel,
+      time: String(data.time),
+      timeMs: timeMs,
+      crowdSource: data.crowdSource,
+      confidence: data.confidence,
+      arrivalSeq: 0
+    }
+  };
+}
+
+function onMessageReceived(raw) {
+  const parsed = parseMsgPayload(raw);
+  if (!parsed.ok) { log('warn', '报文拒收: ' + parsed.error); return; }
+  const msg = parsed.msg;
+  const zone = state[msg.zoneId];
+  msg.arrivalSeq = ++arrivalSeqGlobal;
+
+  const h = dedupHash(msg.zoneId, msg.time);
+  if (zone.seenHashes.has(h)) {
+    log('dedup', msg.zoneId + ' 重复消息丢弃 (hash=' + h + ', time=' + shortTime(msg.time) + ')');
+    return;
+  }
+  zone.seenHashes.set(h, Date.now());
+
+  log('recv', msg.zoneId + ' 收到报文 pm25=' + msg.pm25 + ' co2=' + msg.co2 +
+      ' crowd=' + msg.crowdLevel + ' time=' + msg.time);
+  zone.pendingQueue.push(msg);
+  scheduleFlush(zone);
+}
+
+function scheduleFlush(zone) {
+  if (zone.flushFirstArrival === 0) zone.flushFirstArrival = Date.now();
+  if (zone.flushTimer) clearTimeout(zone.flushTimer);
+  const waited = Date.now() - zone.flushFirstArrival;
+  const delay = Math.max(0, Math.min(FLUSH_DELAY_MS, FLUSH_MAX_WAIT_MS - waited));
+  zone.flushTimer = setTimeout(() => flushZone(zone), delay);
+}
+
+function flushZone(zone) {
+  zone.flushTimer = null;
+  zone.flushFirstArrival = 0;
+  if (!zone.pendingQueue.length) return;
+  zone.pendingQueue.sort((a, b) => (a.timeMs - b.timeMs) || (a.arrivalSeq - b.arrivalSeq));
+  const batch = zone.pendingQueue.splice(0);
+  if (batch.length > 1) {
+    log('order', zone.zoneId + ' 乱序重排: ' + batch.map(m => shortTime(m.time)).join(' → '));
+  }
+  batch.forEach(m => processOne(zone, m));
+  render();
+}
+
+function processOne(zone, msg) {
+  if (msg.timeMs <= zone.lastProcessedTimeMs) { handleLate(zone, msg); return; }
+  applyMessage(zone, msg);
+}
+
+function handleLate(zone, msg) {
+  const ev = latestEventOf(zone);
+  if (ev) {
+    ev.verifyDataList.push(snapshot(msg, '迟到消息（旧时间戳）：仅追加历史，不参与状态判定'));
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ') → 仅追加到事件 ' +
+        ev.event_id + ' 的 verifyDataList 历史');
+  } else {
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ')：该区域无事件记录，仅记日志');
+  }
+}
+
+function applyMessage(zone, msg) {
+  zone.lastMsg = msg;
+  zone.lastProcessedTimeMs = msg.timeMs;
+  const status = computeStatus(msg.pm25, msg.co2);
+  if (status === 'normal') handleNormal(zone, msg, status);
+  else handleAbnormal(zone, msg, status, envWeightOf(status));
+}
+
+/* ---------- D3 事件状态机 ---------- */
+
+function handleNormal(zone, msg, status) {
+  const ev = activeEventOf(zone);
+  if (!ev) return;
+  if (ev.eventStatus === 'HANDLING') {
+    recoverEvent(zone, ev, msg, status);
+  } else if (ev.eventStatus === 'OPEN') {
+    ev.verifyDataList.push(snapshot(msg, '正常快照：事件保持 OPEN，等待人工点击【执行干预】'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到正常数据但状态为 OPEN，保持待处理');
+  }
+}
+
+function handleAbnormal(zone, msg, status, w) {
+  const ev = activeEventOf(zone);
+  if (!ev) { createEvent(zone, msg, status, w); return; }
+  if (ev.eventStatus === 'OPEN') {
+    ev.problemDesc = problemDescOf(status, msg);
+    ev.verifyDataList.push(snapshot(msg, '持续异常快照：事件保持 OPEN'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 持续异常，保持 OPEN');
+  } else if (ev.eventStatus === 'HANDLING') {
+    const w0 = originWeights.get(ev.event_id) || 1;
+    if (w >= w0) {
+      rollbackToOpen(zone, ev, msg, status, w, w0);
+    } else {
+      ev.verifyDataList.push(snapshot(msg, '好转但仍异常（严重度' + w + ' < 创建时' + w0 + '）：保持 HANDLING'));
+      log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 好转但仍异常，保持 HANDLING');
+    }
+  }
+}
+
+function createEvent(zone, msg, status, w) {
+  zone.eventSeq += 1;
+  const event_id = 'EVT-' + zone.zoneId + '-' + zone.eventSeq;
+  const ev = {
+    event_id: event_id,
+    zoneId: zone.zoneId,
+    startTime: msg.time,
+    problemDesc: problemDescOf(status, msg),
+    priorityReason: scorePriority(msg, status).reason,
+    userAction: '',
+    verifyDataList: [snapshot(msg, '创建事件快照：检测到异常')],
+    eventStatus: 'OPEN',
+    recoverTime: null
+  };
+  originWeights.set(event_id, w);
+  zone.events.push(ev);
+  zone.activeEventId = event_id;
+  log('event', zone.zoneId + ' 新建事件 ' + event_id + ' [' + STATUS_LABELS[status] + ']，状态=OPEN');
+}
+
+function recoverEvent(zone, ev, msg, status) {
+  ev.eventStatus = 'RECOVERED';
+  ev.recoverTime = msg.time;
+  ev.verifyDataList.push(snapshot(msg, '恢复快照：新消息指标满足恢复条件（正常），HANDLING→RECOVERED'));
+  zone.activeEventId = null;
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到后续新数据满足恢复条件：HANDLING→RECOVERED');
+}
+
+function rollbackToOpen(zone, ev, msg, status, w, w0) {
+  ev.eventStatus = 'OPEN';
+  ev.problemDesc = problemDescOf(status, msg);
+  ev.verifyDataList.push(snapshot(msg, '恶化回退快照：新数据严重度' + w + ' >= 创建时' + w0 + '，HANDLING 回退 OPEN'));
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 指标恶化（严重度' + w + '>=' + w0 + '）：HANDLING→OPEN');
+}
+
+function handleIntervention(zoneId) {
+  const zone = state[zoneId];
+  const ev = activeEventOf(zone);
+  if (!ev || ev.eventStatus !== 'OPEN') {
+    log('warn', zoneId + ' 干预操作无效：当前无 OPEN 状态的活动事件');
+    return;
+  }
+  ev.eventStatus = 'HANDLING';
+  ev.userAction = '人工点击【执行干预】按钮（' + new Date().toLocaleString('zh-CN', { hour12: false }) + '）';
+  log('event', zoneId + ' 事件 ' + ev.event_id + ' 人工干预：OPEN→HANDLING');
+  render();
+}
+
+function onControlReceived(raw) {
+  let cmd;
+  try { cmd = JSON.parse(raw); } catch (e) { log('warn', '控制指令解析失败: ' + e.message); return; }
+  if (!cmd || !VALID_ZONES.includes(cmd.zoneId) || cmd.action !== 'intervene') {
+    log('warn', '非法控制指令丢弃: ' + raw);
+    return;
+  }
+  log('event', '收到控制指令：' + cmd.zoneId + ' 执行干预');
+  handleIntervention(cmd.zoneId);
+}
+
+function getPriorityList() {
+  const rows = [];
+  VALID_ZONES.forEach(zoneId => {
+    const zone = state[zoneId];
+    if (!zone.lastMsg) return;
+    const status = computeStatus(zone.lastMsg.pm25, zone.lastMsg.co2);
+    const p = scorePriority(zone.lastMsg, status);
+    rows.push({
+      zoneId: zoneId, zoneName: ZONE_NAMES[zoneId], status: status,
+      score: p.score, reason: p.reason, needReview: p.needReview
+    });
+  });
+  rows.sort((a, b) => b.score - a.score);
+  return rows;
+}
+
+/* =====================================================================
+ * E3 UI 渲染层（简化界面）
+ * ===================================================================== */
+
+let selectedZone = 'zone-n';   // 局部 UI 状态（zone 切换），不写回 MQTT
+
+function statusBadgeHtml(statusCode) {
+  return '<span class="badge ' + STATUS_CSS[statusCode] + '"><span class="dot"></span>' +
+         STATUS_LABELS[statusCode] + '</span>';
+}
+
+function render() {
+  renderZoneTabs();
+  renderZoneCard();
+  renderEventBlock();
+  renderHistory();
+  renderLog();
+}
+
+function renderZoneTabs() {
+  const root = document.getElementById('zone-tabs');
+  root.innerHTML = VALID_ZONES.map(zoneId =>
+    '<button class="zc-' + zoneId + (zoneId === selectedZone ? ' active' : '') +
+    '" onclick="selectZone(\'' + zoneId + '\')">' + ZONE_NAMES[zoneId] + '<br><span style="font-size:10px;opacity:.75">' + zoneId + '</span></button>'
+  ).join('');
+}
+
+function selectZone(zoneId) {
+  selectedZone = zoneId;
+  render();
+}
+
+function renderZoneCard() {
+  const zone = state[selectedZone];
+  const msg = zone.lastMsg;
+  document.getElementById('zone-head').innerHTML =
+    '<span style="font-size:12px;color:var(--ink-3)">' + selectedZone + ' · ' + ZONE_NAMES[selectedZone] + '</span>' +
+    (msg ? statusBadgeHtml(computeStatus(msg.pm25, msg.co2)) : '');
+  const root = document.getElementById('zone-card');
+  if (!msg) {
+    root.innerHTML = '<div class="empty">等待数据…（与 Web 监测台同源订阅 ' + MQTT_TOPIC + '）</div>';
+    return;
+  }
+  const status = computeStatus(msg.pm25, msg.co2);
+  const p = scorePriority(msg, status);
+  root.innerHTML =
+    '<div class="stat-grid">' +
+      '<div class="stat"><div class="stat-label">PM2.5</div><div class="stat-value">' + fmt(msg.pm25) + '</div></div>' +
+      '<div class="stat"><div class="stat-label">CO₂</div><div class="stat-value">' + fmt(msg.co2) + '</div></div>' +
+      '<div class="stat"><div class="stat-label">人流</div><div class="stat-value">' + msg.crowdLevel + '</div></div>' +
+    '</div>' +
+    '<div class="row"><span class="k">状态</span><span class="v">' + statusBadgeHtml(status) + '</span></div>' +
+    '<div class="row"><span class="k">优先分数</span><span class="v">' + p.score + ' 分' +
+      (p.needReview ? '（需人工复核）' : '') + '</span></div>' +
+    '<div class="row"><span class="k">更新时间</span><span class="v">' + fmtTime(msg.timeMs) + '</span></div>';
+}
+
+function renderEventBlock() {
+  const root = document.getElementById('event-block');
+  const zone = state[selectedZone];
+  const ev = activeEventOf(zone);
+  if (!ev) {
+    root.innerHTML = '<div class="empty">当前区域无活动事件</div>';
+    return;
+  }
+  const btnEnabled = ev.eventStatus === 'OPEN';
+  let btnText = '执行干预';
+  if (ev.eventStatus === 'HANDLING') btnText = '处理中（等待后续数据恢复）';
+  else if (ev.eventStatus === 'RECOVERED') btnText = '已恢复';
+  root.innerHTML =
+    '<div class="row"><span class="k">事件ID</span><span class="v">' + escapeHtml(ev.event_id) + '</span></div>' +
+    '<div class="row"><span class="k">状态</span><span class="v"><span class="badge ' + EVENT_STATUS_CSS[ev.eventStatus] +
+      '"><span class="dot"></span>' + EVENT_STATUS_LABELS[ev.eventStatus] + '</span></span></div>' +
+    '<div class="row"><span class="k">问题描述</span><span class="v">' + escapeHtml(ev.problemDesc) + '</span></div>' +
+    '<div class="row"><span class="k">人工操作</span><span class="v">' + escapeHtml(ev.userAction || '—') + '</span></div>' +
+    '<button id="btn-intervene" ' + (btnEnabled ? '' : 'disabled') +
+      ' onclick="publishIntervention()">' + btnText + '</button>';
+}
+
+function renderHistory() {
+  const root = document.getElementById('history');
+  const zone = state[selectedZone];
+  if (!zone.events.length) {
+    root.innerHTML = '<div class="empty">暂无事件记录</div>';
+    return;
+  }
+  root.innerHTML = zone.events.slice().reverse().map(ev =>
+    '<div class="row"><span class="k">' + escapeHtml(ev.event_id) + '</span>' +
+    '<span class="v"><span class="badge ' + EVENT_STATUS_CSS[ev.eventStatus] + '"><span class="dot"></span>' +
+    EVENT_STATUS_LABELS[ev.eventStatus] + '</span></span></div>'
+  ).join('');
+}
+
+function renderLog() {
+  const root = document.getElementById('log-panel');
+  root.innerHTML = backendLogs.map(l =>
+    '<div class="log-line log-' + l.type + '"><span class="log-time">' + l.time + '</span>' +
+    '[' + (LOG_TYPE_LABELS[l.type] || l.type) + '] ' + escapeHtml(l.text) + '</div>'
+  ).join('') || '<div class="empty">暂无日志…</div>';
+}
+
+/* ---------- 跨端干预：发布控制主题指令，驱动 D3 状态流转 ---------- */
+function publishIntervention() {
+  if (!client || !client.connected) {
+    toast('未连接 broker，无法发送干预指令');
+    return;
+  }
+  const ev = activeEventOf(state[selectedZone]);
+  if (!ev || ev.eventStatus !== 'OPEN') {
+    toast('当前无待处理（OPEN）事件');
+    return;
+  }
+  const cmd = { zoneId: selectedZone, action: 'intervene', time: new Date().toISOString() };
+  client.publish(CONTROL_TOPIC, JSON.stringify(cmd), { qos: 0 });
+  toast('干预指令已发送：' + selectedZone + ' → 监测台 / E1 / 本端同步执行');
+  log('event', '已发布控制指令：' + selectedZone + ' 执行干预');
+  // 指令经 broker 回环后由 onControlReceived → handleIntervention 幂等执行（三端收敛）
+}
+
+let toastTimer = null;
+function toast(text) {
+  const el = document.getElementById('toast');
+  el.textContent = text;
+  el.style.opacity = '1';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.opacity = '0'; }, 2600);
+}
+
+/* =====================================================================
+ * MQTT 连接（候选地址回退 + 数据/控制双主题）
+ * ===================================================================== */
+
+let client = null;
+let connectAttempt = 0;
+
+function setConnState(text, cls) {
+  const badge = document.getElementById('conn-badge');
+  document.getElementById('conn-text').textContent = text;
+  badge.className = cls || '';
+}
+
+function initMqtt() { attemptConnect(0); }
+
+function attemptConnect(index) {
+  const url = MQTT_BROKER_CANDIDATES[index % MQTT_BROKER_CANDIDATES.length];
+  const attemptId = ++connectAttempt;
+  setConnState('连接中 ' + url + ' …', 'reconnecting');
+  log('info', '尝试连接 ' + url + ' …');
+  const c = mqtt.connect(url, {
+    clientId: 'airguard-e3-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 2000,
+    connectTimeout: 4000,
+    keepalive: 30,
+    path: '/mqtt'
+  });
+  let connected = false;
+  c.on('connect', () => {
+    connected = true;
+    if (attemptId !== connectAttempt) { c.end(); return; }
+    client = c;
+    setConnState('已连接 ' + url, 'connected');
+    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + ' / ' + CONTROL_TOPIC);
+    c.subscribe([MQTT_TOPIC, CONTROL_TOPIC], { qos: 0 }, (err) => {
+      if (err) log('warn', '订阅失败: ' + err.message);
+    });
+  });
+  c.on('error', (e) => {
+    if (attemptId !== connectAttempt) return;
+    if (connected) {
+      setConnState('连接错误', 'disconnected');
+      log('warn', 'MQTT错误: ' + (e && e.message ? e.message : e));
+      return;
+    }
+    log('warn', '连接 ' + url + ' 失败（' + (e && e.message ? e.message : e) + '），切换下一候选');
+    c.end(true);
+    attemptConnect(index + 1);
+  });
+  c.on('close', () => {
+    if (attemptId === connectAttempt && connected) setConnState('已断开', 'disconnected');
+  });
+  c.on('reconnect', () => { if (attemptId === connectAttempt) setConnState('重连中…', 'reconnecting'); });
+  c.on('offline', () => { if (attemptId === connectAttempt) setConnState('离线', 'disconnected'); });
+  c.on('message', (topic, payload) => {
+    if (attemptId !== connectAttempt) return;
+    if (topic === CONTROL_TOPIC) onControlReceived(payload.toString());
+    else onMessageReceived(payload.toString());
+  });
+}
+
+/* =====================================================================
+ * 启动
+ * ===================================================================== */
+
+function initApp() {
+  log('info', 'E3 移动端初始化完成');
+  render();
+  initMqtt();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  if (window.mqtt) {
+    initApp();
+  } else {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/mqtt@5/dist/mqtt.min.js';
+    s.onload = initApp;
+    s.onerror = () => {
+      setConnState('mqtt.js CDN 加载失败', 'disconnected');
+      log('warn', 'mqtt.js 两个公开 CDN 均加载失败，请检查网络');
+    };
+    document.head.appendChild(s);
+  }
+});
+</script>
+</body>
+</html>

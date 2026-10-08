@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AirGuard E2 · 多模态交互</title>
+<!--
+=====================================================================
+ AirGuard E2 — 浏览器原生 API 多模态（multimodal/index.html）
+ 1. getUserMedia 摄像头 + Web Speech API（webkitSpeechRecognition）ASR + speechSynthesis TTS
+ 2. ASR 指令："查看zone-w"切换选中区域；"朗读状态"TTS播报当前选中 zone 实时数据；
+    "记录现场"触发摄像头拍照。至少一条指令改变系统内部状态（切区/拍照均改变）。
+ 3. 拍照生成感知记录 JSON：zoneId, imageId, crowdLevel, confidence, source, time；
+    source="simulated"（crowdLevel 取该 zone 运行时实时值，无 YOLO/图像检测模型）。
+
+ 【复用说明】
+   本页内嵌与 index.html【逐字一致】的后端逻辑层（D1状态计算/D2打分/D3状态机/
+   去重排序管线），修改须四端同步。TTS 播报内容全部从运行时 state 读取，禁止写死。
+
+ 【已知边界】
+   - file:// 下 getUserMedia 属安全上下文但部分环境可能拒绝 → 运行时探测 + 降级提示
+     （用 py -m http.server 8000 后访问 http://localhost:8000/multimodal/），
+     摄像头不可用时 ASR/TTS/MQTT 不受影响；【记录现场】仍可生成感知记录（无照片）。
+   - ASR 默认走云端 Google 服务（大陆网络可能报 network 错）→ 优先探测 Chrome 139+
+     本地识别（processLocally），不可用时页面提示 + 手动按钮兜底（必须可用）。
+   - TTS 使用系统离线中文语音（Windows 提供 Microsoft Huihui 等，无需网络）。
+
+ 【CDN】仅 mqtt.js@5（jsdelivr 主 + unpkg 备）；CSS 手写。
+=====================================================================
+-->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --st-good: #0ca30c; --st-warning: #fab219; --st-serious: #ec835a; --st-critical: #d03b3b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; }
+.wrap { max-width: 1100px; margin: 0 auto; padding: 16px 20px 48px; }
+header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; }
+.sub { color: var(--ink-3); font-size: 12px; margin-top: 4px; }
+#conn-badge { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+#conn-badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+#conn-badge.connected .dot { background: var(--st-good); }
+#conn-badge.reconnecting .dot { background: var(--st-warning); }
+#conn-badge.disconnected .dot { background: var(--st-critical); }
+#cap-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; }
+.cap-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); background: var(--surface); }
+.cap-chip.ok { color: var(--st-good); border-color: var(--st-good); }
+.cap-chip.warn { color: var(--st-warning); border-color: var(--st-warning); }
+.cap-chip.bad { color: var(--st-critical); border-color: var(--st-critical); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 14px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.panel h2 { font-size: 13px; color: var(--ink-2); margin: 0 0 10px; letter-spacing: 1px; }
+video, #cam-placeholder { width: 100%; border-radius: 8px; background: #000; min-height: 180px; object-fit: cover; }
+#cam-placeholder { display: flex; align-items: center; justify-content: center; color: var(--ink-3); font-size: 12px; text-align: center; padding: 20px; }
+#preview { width: 100%; border-radius: 8px; margin-top: 8px; }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+button { background: var(--series-1); color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; cursor: pointer; }
+button:hover { filter: brightness(1.12); }
+button:disabled { background: rgba(255,255,255,.08); color: var(--ink-3); cursor: not-allowed; }
+button.ghost { background: transparent; border: 1px solid var(--border); color: var(--ink-2); }
+button.listening { background: var(--st-critical); }
+.hints { font-size: 12px; color: var(--ink-3); margin-top: 8px; line-height: 1.7; }
+#heard { font-size: 12px; color: var(--ink-2); margin-top: 8px; padding: 8px; border: 1px dashed var(--border); border-radius: 8px; min-height: 18px; }
+.zone-tabs { display: flex; gap: 8px; }
+.zone-tabs button { flex: 1; background: transparent; border: 1px solid var(--border); color: var(--ink-2); padding: 10px 0; }
+.zone-tabs button.active { color: #fff; }
+.zone-tabs button.zc-zone-n.active { background: var(--series-1); border-color: var(--series-1); }
+.zone-tabs button.zc-zone-s.active { background: var(--series-2); border-color: var(--series-2); }
+.zone-tabs button.zc-zone-w.active { background: var(--series-3); border-color: var(--series-3); }
+.stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+.stat { background: rgba(255,255,255,.03); border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
+.stat-label { font-size: 11px; color: var(--ink-3); }
+.stat-value { font-size: 20px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.info-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,.06); font-size: 12px; }
+.info-row .k { color: var(--ink-3); flex: none; }
+.info-row .v { text-align: right; font-variant-numeric: tabular-nums; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid currentColor; background: rgba(255,255,255,.04); white-space: nowrap; }
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.st-good { color: var(--st-good); } .st-warning { color: var(--st-warning); }
+.st-serious { color: var(--st-serious); } .st-critical { color: var(--st-critical); }
+.record { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; font-size: 12px; }
+.record .r-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.record .r-thumb { width: 100%; border-radius: 6px; margin-top: 8px; }
+.record pre { background: rgba(255,255,255,.04); border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 11px; margin: 8px 0 0; }
+.empty { color: var(--ink-3); text-align: center; padding: 16px 0; font-size: 12px; }
+#log-panel { max-height: 180px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+.log-line { padding: 2px 0; border-bottom: 1px dashed rgba(255,255,255,.05); }
+.log-time { color: var(--ink-3); margin-right: 8px; }
+.log-recv { color: var(--ink-2); } .log-info { color: var(--ink-3); }
+.log-dedup { color: var(--st-warning); } .log-late { color: var(--st-warning); }
+.log-order { color: var(--series-1); } .log-event { color: var(--series-3); } .log-warn { color: var(--st-critical); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>AirGuard E2 · 多模态交互</h1>
+      <div class="sub">摄像头拍照 · 语音指令（ASR）· 语音播报（TTS）· 感知记录 JSON（source=simulated）</div>
+    </div>
+    <span id="conn-badge"><span class="dot"></span><span id="conn-text">连接中…</span></span>
+  </header>
+
+  <div id="cap-bar">
+    <span class="cap-chip" id="cap-cam">摄像头：检测中…</span>
+    <span class="cap-chip" id="cap-asr">语音识别：检测中…</span>
+    <span class="cap-chip" id="cap-tts">语音播报：检测中…</span>
+  </div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>现场摄像头（getUserMedia）</h2>
+      <video id="video" autoplay playsinline muted></video>
+      <div id="cam-placeholder" class="hidden"></div>
+      <img id="preview" class="hidden" alt="拍照预览">
+      <div class="btn-row">
+        <button id="btn-cam" class="ghost">开启摄像头</button>
+        <button id="btn-capture" disabled>记录现场（拍照）</button>
+      </div>
+      <div class="hints" id="cam-hint"></div>
+    </section>
+
+    <section class="panel">
+      <h2>语音指令（Web Speech ASR）</h2>
+      <div class="btn-row">
+        <button id="btn-asr">开始语音监听</button>
+      </div>
+      <div class="hints">
+        可用指令：<br>
+        · "查看宿舍区" / "查看教学区" / "查看食堂区"（或 查看zone-n/s/w）→ 切换选中区域<br>
+        · "朗读状态" → TTS 播报当前选中区域实时数据<br>
+        · "记录现场" → 触发摄像头拍照并生成感知记录
+      </div>
+      <div id="heard">上次识别：—</div>
+    </section>
+
+    <section class="panel">
+      <h2>当前选中区域</h2>
+      <div class="zone-tabs" id="zone-tabs"></div>
+      <div id="zone-info"></div>
+      <div class="btn-row">
+        <button id="btn-speak" class="ghost">朗读状态（TTS）</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>感知记录（source=simulated）</h2>
+      <div id="records"></div>
+    </section>
+
+    <section class="panel">
+      <h2>运行日志</h2>
+      <div id="log-panel"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+ * 【共享后端逻辑层】与 index.html 逐字保持一致，修改须四端同步
+ * ===================================================================== */
+
+const VALID_ZONES = ['zone-n', 'zone-s', 'zone-w'];
+const ZONE_NAMES = { 'zone-n': '宿舍区', 'zone-s': '教学区', 'zone-w': '食堂区' };
+
+const FLUSH_DELAY_MS = 300;
+const FLUSH_MAX_WAIT_MS = 1000;
+
+const STATUS_LABELS = { heavy: '重度污染', light: '轻度污染', vent: '通风不足风险', normal: '正常' };
+const ENV_WEIGHT = { heavy: 4, light: 3, vent: 2, normal: 1 };
+const STATUS_CSS = { heavy: 'st-critical', light: 'st-serious', vent: 'st-warning', normal: 'st-good' };
+const EVENT_STATUS_LABELS = { OPEN: '待处理', HANDLING: '处理中', RECOVERED: '已恢复' };
+const EVENT_STATUS_CSS = { OPEN: 'st-warning', HANDLING: 'st-serious', RECOVERED: 'st-good' };
+const LOG_TYPE_LABELS = { recv: '收到', dedup: '去重', late: '迟到', order: '排序', event: '事件', warn: '警告', info: '信息' };
+
+const MQTT_BROKER_CANDIDATES = ['ws://10.102.128.15:8083/mqtt', 'ws://127.0.0.1:8083/mqtt'];
+const MQTT_TOPIC = 'airguard/zones/all';
+const CONTROL_TOPIC = 'airguard/zones/control';
+
+function hashKeyStr(zoneId, timeStr) { return zoneId + '|' + timeStr; }
+
+function djb2(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) ^ str.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
+}
+const dedupHash = (zoneId, timeStr) => djb2(hashKeyStr(zoneId, timeStr));
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+const fmt = n => Math.round(n);
+function fmtTime(ms) { return new Date(ms).toLocaleString('zh-CN', { hour12: false }); }
+function shortTime(iso) { return String(iso).slice(11, 19); }
+
+function computeStatus(pm25, co2) {
+  if (pm25 > 150) return 'heavy';
+  if (pm25 > 75) return 'light';
+  if (co2 >= 1500) return 'vent';
+  return 'normal';
+}
+function envWeightOf(statusCode) { return ENV_WEIGHT[statusCode]; }
+
+function needsReviewOf(msg) {
+  return msg.crowdSource === 'model' && !(typeof msg.confidence === 'number' && msg.confidence >= 0.6);
+}
+
+function scorePriority(msg, status) {
+  const w = envWeightOf(status);
+  if (needsReviewOf(msg)) {
+    return {
+      score: w * 2,
+      needReview: true,
+      reason: '模型人群数据置信度' + (msg.confidence == null ? '缺失' : msg.confidence) +
+              ' < 0.6，标记需人工复核，crowdLevel=' + msg.crowdLevel + ' 不计分；' +
+              '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 = ' + (w * 2)
+    };
+  }
+  return {
+    score: w * 2 + msg.crowdLevel,
+    needReview: false,
+    reason: '环境[' + STATUS_LABELS[status] + ']权重' + w + '×2 + crowdLevel' +
+            msg.crowdLevel + ' = ' + (w * 2 + msg.crowdLevel)
+  };
+}
+
+function snapshot(msg, note) {
+  return {
+    time: msg.time,
+    pm25: msg.pm25,
+    co2: msg.co2,
+    crowdLevel: msg.crowdLevel,
+    status: computeStatus(msg.pm25, msg.co2),
+    note: note
+  };
+}
+
+function problemDescOf(status, msg) {
+  if (status === 'heavy') return '重度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'light') return '轻度污染（PM2.5=' + msg.pm25 + '）';
+  if (status === 'vent') return '通风不足风险（CO2=' + msg.co2 + '）';
+  return '正常';
+}
+
+function newZoneState(zoneId) {
+  return {
+    zoneId: zoneId,
+    lastMsg: null,
+    lastProcessedTimeMs: -Infinity,
+    activeEventId: null,
+    events: [],
+    seenHashes: new Map(),
+    pendingQueue: [],
+    flushTimer: null,
+    flushFirstArrival: 0,
+    eventSeq: 0
+  };
+}
+
+function createZoneStates() {
+  const states = {};
+  VALID_ZONES.forEach(z => { states[z] = newZoneState(z); });
+  return states;
+}
+
+const state = createZoneStates();
+const originWeights = new Map();
+
+let arrivalSeqGlobal = 0;
+const backendLogs = [];
+function log(type, text) {
+  backendLogs.unshift({
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    type: type, text: text
+  });
+  if (backendLogs.length > 200) backendLogs.pop();
+}
+
+function activeEventOf(zone) {
+  if (!zone.activeEventId) return null;
+  return zone.events.find(e => e.event_id === zone.activeEventId) || null;
+}
+
+function latestEventOf(zone) {
+  if (!zone.events.length) return null;
+  return zone.events.reduce((a, b) =>
+    (Date.parse(b.startTime) > Date.parse(a.startTime) ? b : a), zone.events[0]);
+}
+
+function parseMsgPayload(raw) {
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return { ok: false, error: 'JSON解析失败: ' + e.message }; }
+  if (!data || typeof data !== 'object') return { ok: false, error: '报文不是JSON对象' };
+  if (!VALID_ZONES.includes(data.zoneId)) return { ok: false, error: '未知zoneId: ' + data.zoneId };
+  if (typeof data.pm25 !== 'number' || !isFinite(data.pm25)) return { ok: false, error: 'pm25非法' };
+  if (typeof data.co2 !== 'number' || !isFinite(data.co2)) return { ok: false, error: 'co2非法' };
+  let crowdLevel = data.crowdLevel;
+  if (typeof crowdLevel !== 'number' || !isFinite(crowdLevel)) crowdLevel = 0;
+  crowdLevel = Math.max(0, Math.min(3, Math.round(crowdLevel)));
+  const timeMs = Date.parse(data.time);
+  if (isNaN(timeMs)) return { ok: false, error: 'time非法: ' + data.time };
+  return {
+    ok: true,
+    msg: {
+      zoneId: data.zoneId,
+      pm25: data.pm25,
+      co2: data.co2,
+      crowdLevel: crowdLevel,
+      time: String(data.time),
+      timeMs: timeMs,
+      crowdSource: data.crowdSource,
+      confidence: data.confidence,
+      arrivalSeq: 0
+    }
+  };
+}
+
+function onMessageReceived(raw) {
+  const parsed = parseMsgPayload(raw);
+  if (!parsed.ok) { log('warn', '报文拒收: ' + parsed.error); return; }
+  const msg = parsed.msg;
+  const zone = state[msg.zoneId];
+  msg.arrivalSeq = ++arrivalSeqGlobal;
+
+  const h = dedupHash(msg.zoneId, msg.time);
+  if (zone.seenHashes.has(h)) {
+    log('dedup', msg.zoneId + ' 重复消息丢弃 (hash=' + h + ', time=' + shortTime(msg.time) + ')');
+    return;
+  }
+  zone.seenHashes.set(h, Date.now());
+
+  log('recv', msg.zoneId + ' 收到报文 pm25=' + msg.pm25 + ' co2=' + msg.co2 +
+      ' crowd=' + msg.crowdLevel + ' time=' + msg.time);
+  zone.pendingQueue.push(msg);
+  scheduleFlush(zone);
+}
+
+function scheduleFlush(zone) {
+  if (zone.flushFirstArrival === 0) zone.flushFirstArrival = Date.now();
+  if (zone.flushTimer) clearTimeout(zone.flushTimer);
+  const waited = Date.now() - zone.flushFirstArrival;
+  const delay = Math.max(0, Math.min(FLUSH_DELAY_MS, FLUSH_MAX_WAIT_MS - waited));
+  zone.flushTimer = setTimeout(() => flushZone(zone), delay);
+}
+
+function flushZone(zone) {
+  zone.flushTimer = null;
+  zone.flushFirstArrival = 0;
+  if (!zone.pendingQueue.length) return;
+  zone.pendingQueue.sort((a, b) => (a.timeMs - b.timeMs) || (a.arrivalSeq - b.arrivalSeq));
+  const batch = zone.pendingQueue.splice(0);
+  if (batch.length > 1) {
+    log('order', zone.zoneId + ' 乱序重排: ' + batch.map(m => shortTime(m.time)).join(' → '));
+  }
+  batch.forEach(m => processOne(zone, m));
+  render();
+}
+
+function processOne(zone, msg) {
+  if (msg.timeMs <= zone.lastProcessedTimeMs) { handleLate(zone, msg); return; }
+  applyMessage(zone, msg);
+}
+
+function handleLate(zone, msg) {
+  const ev = latestEventOf(zone);
+  if (ev) {
+    ev.verifyDataList.push(snapshot(msg, '迟到消息（旧时间戳）：仅追加历史，不参与状态判定'));
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ') → 仅追加到事件 ' +
+        ev.event_id + ' 的 verifyDataList 历史');
+  } else {
+    log('late', zone.zoneId + ' 迟到消息(time=' + shortTime(msg.time) + ')：该区域无事件记录，仅记日志');
+  }
+}
+
+function applyMessage(zone, msg) {
+  zone.lastMsg = msg;
+  zone.lastProcessedTimeMs = msg.timeMs;
+  const status = computeStatus(msg.pm25, msg.co2);
+  if (status === 'normal') handleNormal(zone, msg, status);
+  else handleAbnormal(zone, msg, status, envWeightOf(status));
+}
+
+/* ---------- D3 事件状态机 ---------- */
+
+function handleNormal(zone, msg, status) {
+  const ev = activeEventOf(zone);
+  if (!ev) return;
+  if (ev.eventStatus === 'HANDLING') {
+    recoverEvent(zone, ev, msg, status);
+  } else if (ev.eventStatus === 'OPEN') {
+    ev.verifyDataList.push(snapshot(msg, '正常快照：事件保持 OPEN，等待人工点击【执行干预】'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到正常数据但状态为 OPEN，保持待处理');
+  }
+}
+
+function handleAbnormal(zone, msg, status, w) {
+  const ev = activeEventOf(zone);
+  if (!ev) { createEvent(zone, msg, status, w); return; }
+  if (ev.eventStatus === 'OPEN') {
+    ev.problemDesc = problemDescOf(status, msg);
+    ev.verifyDataList.push(snapshot(msg, '持续异常快照：事件保持 OPEN'));
+    log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 持续异常，保持 OPEN');
+  } else if (ev.eventStatus === 'HANDLING') {
+    const w0 = originWeights.get(ev.event_id) || 1;
+    if (w >= w0) {
+      rollbackToOpen(zone, ev, msg, status, w, w0);
+    } else {
+      ev.verifyDataList.push(snapshot(msg, '好转但仍异常（严重度' + w + ' < 创建时' + w0 + '）：保持 HANDLING'));
+      log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 好转但仍异常，保持 HANDLING');
+    }
+  }
+}
+
+function createEvent(zone, msg, status, w) {
+  zone.eventSeq += 1;
+  const event_id = 'EVT-' + zone.zoneId + '-' + zone.eventSeq;
+  const ev = {
+    event_id: event_id,
+    zoneId: zone.zoneId,
+    startTime: msg.time,
+    problemDesc: problemDescOf(status, msg),
+    priorityReason: scorePriority(msg, status).reason,
+    userAction: '',
+    verifyDataList: [snapshot(msg, '创建事件快照：检测到异常')],
+    eventStatus: 'OPEN',
+    recoverTime: null
+  };
+  originWeights.set(event_id, w);
+  zone.events.push(ev);
+  zone.activeEventId = event_id;
+  log('event', zone.zoneId + ' 新建事件 ' + event_id + ' [' + STATUS_LABELS[status] + ']，状态=OPEN');
+}
+
+function recoverEvent(zone, ev, msg, status) {
+  ev.eventStatus = 'RECOVERED';
+  ev.recoverTime = msg.time;
+  ev.verifyDataList.push(snapshot(msg, '恢复快照：新消息指标满足恢复条件（正常），HANDLING→RECOVERED'));
+  zone.activeEventId = null;
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 收到后续新数据满足恢复条件：HANDLING→RECOVERED');
+}
+
+function rollbackToOpen(zone, ev, msg, status, w, w0) {
+  ev.eventStatus = 'OPEN';
+  ev.problemDesc = problemDescOf(status, msg);
+  ev.verifyDataList.push(snapshot(msg, '恶化回退快照：新数据严重度' + w + ' >= 创建时' + w0 + '，HANDLING 回退 OPEN'));
+  log('event', zone.zoneId + ' 事件 ' + ev.event_id + ' 指标恶化（严重度' + w + '>=' + w0 + '）：HANDLING→OPEN');
+}
+
+function handleIntervention(zoneId) {
+  const zone = state[zoneId];
+  const ev = activeEventOf(zone);
+  if (!ev || ev.eventStatus !== 'OPEN') {
+    log('warn', zoneId + ' 干预操作无效：当前无 OPEN 状态的活动事件');
+    return;
+  }
+  ev.eventStatus = 'HANDLING';
+  ev.userAction = '人工点击【执行干预】按钮（' + new Date().toLocaleString('zh-CN', { hour12: false }) + '）';
+  log('event', zoneId + ' 事件 ' + ev.event_id + ' 人工干预：OPEN→HANDLING');
+  render();
+}
+
+function onControlReceived(raw) {
+  let cmd;
+  try { cmd = JSON.parse(raw); } catch (e) { log('warn', '控制指令解析失败: ' + e.message); return; }
+  if (!cmd || !VALID_ZONES.includes(cmd.zoneId) || cmd.action !== 'intervene') {
+    log('warn', '非法控制指令丢弃: ' + raw);
+    return;
+  }
+  log('event', '收到控制指令（远端页面）：' + cmd.zoneId + ' 执行干预');
+  handleIntervention(cmd.zoneId);
+}
+
+function getPriorityList() {
+  const rows = [];
+  VALID_ZONES.forEach(zoneId => {
+    const zone = state[zoneId];
+    if (!zone.lastMsg) return;
+    const status = computeStatus(zone.lastMsg.pm25, zone.lastMsg.co2);
+    const p = scorePriority(zone.lastMsg, status);
+    rows.push({
+      zoneId: zoneId, zoneName: ZONE_NAMES[zoneId], status: status,
+      score: p.score, reason: p.reason, needReview: p.needReview
+    });
+  });
+  rows.sort((a, b) => b.score - a.score);
+  return rows;
+}
+
+/* =====================================================================
+ * E2 媒体能力层：摄像头 / ASR / TTS / 感知记录
+ * ===================================================================== */
+
+let selectedZone = 'zone-n';      // 系统选中区域（语音指令"查看xxx"改变此内部状态）
+let recognition = null;
+let asrEnabled = false;
+const records = [];               // { record: 6字段JSON, photoDataUrl: string|null }
+
+const video = document.getElementById('video');
+const snapCanvas = document.createElement('canvas');
+const camHintEl = document.getElementById('cam-hint');
+const heardEl = document.getElementById('heard');
+
+/* ---------- 能力探测（运行时，含降级提示） ---------- */
+function initCapabilities() {
+  // 摄像头
+  const camOk = window.isSecureContext && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  setCap('cap-cam', camOk ? '摄像头：可用' : '摄像头：受限（需安全上下文）', camOk ? 'ok' : 'bad');
+  camHintEl.textContent = camOk
+    ? '点击"开启摄像头"授权后可用；file:// 下个别环境可能拒绝，可改用 py -m http.server 8000 后访问 http://localhost:8000/multimodal/'
+    : '当前环境不支持摄像头（file:// 被策略拒绝时，请用 py -m http.server 8000 后访问 http://localhost:8000/multimodal/）；语音指令与 MQTT 不受影响。';
+  // ASR
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    setCap('cap-asr', '语音识别：不支持（请用 Chrome/Edge）', 'bad');
+  } else {
+    let localTxt = '云端识别';
+    if (typeof SR.available === 'function') {
+      try {
+        if (SR.available() === 'available') localTxt = '本地识别（离线）';
+      } catch (e) { /* 旧版本无此接口，忽略 */ }
+    }
+    setCap('cap-asr', '语音识别：可用（' + localTxt + '）', 'ok');
+  }
+  // TTS
+  if (!('speechSynthesis' in window)) {
+    setCap('cap-tts', '语音播报：不支持', 'bad');
+  } else {
+    const zhVoice = pickZhVoice();
+    setCap('cap-tts', zhVoice ? '语音播报：可用（' + zhVoice.name + '，离线）' : '语音播报：可用（未检测到中文语音，播报可能为默认音色）',
+           zhVoice ? 'ok' : 'warn');
+  }
+}
+
+function setCap(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'cap-chip ' + cls;
+}
+
+/* ---------- 摄像头与拍照 ---------- */
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    camFail('当前环境不支持 getUserMedia');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 } }
+    });
+    video.srcObject = stream;
+    video.classList.remove('hidden');
+    document.getElementById('cam-placeholder').classList.add('hidden');
+    camHintEl.textContent = '摄像头已开启，可执行"记录现场"拍照。';
+    log('info', '摄像头已开启（getUserMedia）');
+  } catch (e) {
+    camFail('摄像头不可用（' + e.name + '）：file:// 下若被拒绝，请用 py -m http.server 8000 后访问 http://localhost:8000/multimodal/');
+  }
+}
+
+function camFail(msg) {
+  camHintEl.textContent = msg;
+  log('warn', msg);
+  // 降级：ASR/TTS/MQTT 不受影响；记录现场仍可生成感知记录（无照片）
+}
+
+/** 拍照并生成感知记录（6 字段：zoneId,imageId,crowdLevel,confidence,source,time） */
+function capturePhoto() {
+  const zone = state[selectedZone];
+  const msg = zone.lastMsg;
+  if (!msg) {
+    feedback('该区域暂无数据，无法生成感知记录（请先运行 mqtt_publish.py）');
+    return;
+  }
+  let photoDataUrl = null;
+  if (video.srcObject && video.videoWidth) {
+    snapCanvas.width = video.videoWidth;
+    snapCanvas.height = video.videoHeight;
+    snapCanvas.getContext('2d').drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+    photoDataUrl = snapCanvas.toDataURL('image/jpeg', 0.9);
+  }
+  const record = buildPerceptionRecord(selectedZone);
+  records.unshift({ record: record, photoDataUrl: photoDataUrl });
+  log('event', '生成感知记录 ' + record.imageId +
+      ' (zone=' + record.zoneId + ', crowdLevel=' + record.crowdLevel + ', source=simulated)');
+  feedback('已生成感知记录 ' + record.imageId + (photoDataUrl ? '（含现场照片）' : '（摄像头未开启，无照片）'));
+  render();
+}
+
+function buildPerceptionRecord(zoneId) {
+  const now = new Date();
+  const pad2 = n => String(n).padStart(2, '0');
+  const ts = now.getFullYear() + pad2(now.getMonth() + 1) + pad2(now.getDate()) +
+             pad2(now.getHours()) + pad2(now.getMinutes()) + pad2(now.getSeconds());
+  // 严格 6 字段；crowdLevel 取该 zone 运行时实时值（simulated 来源，无检测模型）
+  return {
+    zoneId: zoneId,
+    imageId: 'IMG-' + zoneId + '-' + ts + '-' + Math.random().toString(16).slice(2, 6),
+    crowdLevel: state[zoneId].lastMsg.crowdLevel,
+    confidence: 1.0,
+    source: 'simulated',
+    time: new Date().toISOString()
+  };
+}
+
+function downloadJson(record) {
+  const blob = new Blob([JSON.stringify(record, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = record.imageId + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function downloadPhoto(imageId, dataUrl) {
+  const a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = imageId + '.jpg';
+  a.click();
+}
+
+/* ---------- ASR（Web Speech API） ---------- */
+function initASR() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return;
+  recognition = new SR();
+  // Chrome 139+ 本地识别探测（大陆网络下云端识别可能不可达，本地识别离线可用）
+  if (typeof SR.available === 'function') {
+    try {
+      if (SR.available() === 'available') {
+        recognition.processLocally = true;
+        log('info', 'ASR 启用本地识别（离线）');
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  recognition.lang = 'zh-CN';
+  recognition.continuous = true;
+  recognition.interimResults = false;
+  recognition.onresult = (ev) => {
+    const text = ev.results[ev.results.length - 1][0].transcript;
+    heardEl.textContent = '上次识别：' + text;
+    parseVoiceCommand(text);
+  };
+  recognition.onerror = (ev) => {
+    if (ev.error === 'network' || ev.error === 'service-not-allowed' || ev.error === 'not-allowed') {
+      stopAsr();
+      feedback('语音识别不可用（' + ev.error + '，云端服务网络受限或权限被拒），请使用手动按钮');
+      log('warn', 'ASR 错误: ' + ev.error);
+    }
+  };
+  recognition.onend = () => {
+    if (asrEnabled) {
+      try { recognition.start(); } catch (e) { /* 已在启动中 */ }
+    }
+  };
+}
+
+function startAsr() {
+  if (!recognition) { feedback('浏览器不支持语音识别（请用 Chrome/Edge）'); return; }
+  asrEnabled = true;
+  try { recognition.start(); } catch (e) { /* 已启动 */ }
+  const btn = document.getElementById('btn-asr');
+  btn.textContent = '停止语音监听';
+  btn.classList.add('listening');
+  feedback('语音监听已开启，请说指令');
+}
+
+function stopAsr() {
+  asrEnabled = false;
+  try { recognition && recognition.stop(); } catch (e) { /* 忽略 */ }
+  const btn = document.getElementById('btn-asr');
+  btn.textContent = '开始语音监听';
+  btn.classList.remove('listening');
+}
+
+/** 指令解析容错：中文别名为主（ASR 对英文字母转写不可靠），zone-正则为辅 */
+const ZONE_ALIASES = { '宿舍': 'zone-n', '教学': 'zone-s', '食堂': 'zone-w' };
+
+function matchZone(text) {
+  for (const key in ZONE_ALIASES) {
+    if (text.indexOf(key) >= 0) return ZONE_ALIASES[key];
+  }
+  const m = text.match(/zone[- ]?([nsw])/i);
+  return m ? 'zone-' + m[1].toLowerCase() : null;
+}
+
+function parseVoiceCommand(raw) {
+  const norm = String(raw).toLowerCase().replace(/[，。！？、,.!?\s]/g, '');
+  const zone = matchZone(String(raw).toLowerCase());
+  if (/查看|切换|切到|看|显示|进入/.test(norm)) {
+    if (zone) {
+      selectZone(zone);   // 改变系统内部状态
+      speak('已切换到' + ZONE_NAMES[zone]);
+    } else {
+      feedback('未识别区域，请说：查看宿舍区 / 查看教学区 / 查看食堂区');
+    }
+  } else if (/朗读|播报/.test(norm)) {
+    speakCurrentZone();
+  } else if (/记录现场|拍照|拍一下/.test(norm)) {
+    capturePhoto();
+  } else {
+    feedback('未识别指令："' + raw + '"。可用：查看宿舍区 / 查看教学区 / 查看食堂区 / 朗读状态 / 记录现场');
+  }
+}
+
+function selectZone(zoneId) {
+  selectedZone = zoneId;
+  log('info', '切换选中区域 → ' + zoneId + '（' + ZONE_NAMES[zoneId] + '）');
+  render();
+}
+
+function feedback(text) {
+  log('info', text);
+  heardEl.textContent = text;
+}
+
+/* ---------- TTS（speechSynthesis，播报内容全部运行时读取，禁止写死） ---------- */
+function pickZhVoice() {
+  const voices = speechSynthesis.getVoices();
+  return voices.find(v => /zh-CN/i.test(v.lang) && /huihui/i.test(v.name)) ||
+         voices.find(v => /zh-CN/i.test(v.lang)) ||
+         voices.find(v => /^zh/i.test(v.lang)) ||
+         null;
+}
+
+function speak(text) {
+  if (!('speechSynthesis' in window)) { feedback('浏览器不支持语音播报'); return; }
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN';
+  const v = pickZhVoice();
+  if (v) u.voice = v;
+  speechSynthesis.speak(u);
+  log('info', 'TTS 播报：' + text);
+}
+
+function speakCurrentZone() {
+  const zone = state[selectedZone];
+  const msg = zone.lastMsg;
+  if (!msg) {
+    speak('当前区域' + ZONE_NAMES[selectedZone] + '暂无数据，请先运行模拟发布脚本');
+    return;
+  }
+  const status = computeStatus(msg.pm25, msg.co2);
+  const p = scorePriority(msg, status);
+  const ev = activeEventOf(zone);
+  // 播报内容 100% 来自运行时 state，禁止写死静态文本
+  let text = '当前区域' + selectedZone + ZONE_NAMES[selectedZone] + '。';
+  text += 'PM2.5为' + fmt(msg.pm25) + '，二氧化碳为' + fmt(msg.co2) + '，人流等级' + msg.crowdLevel + '级。';
+  text += '空气质量状态：' + STATUS_LABELS[status] + '。';
+  text += '优先关注分数' + p.score + '分。' + (p.needReview ? '该区域人群数据需人工复核。' : '');
+  if (ev) {
+    text += '活动事件' + ev.event_id + '，状态' + EVENT_STATUS_LABELS[ev.eventStatus] + '，' + ev.problemDesc + '。';
+  } else {
+    text += '当前无活动事件。';
+  }
+  text += '数据更新时间' + fmtTime(msg.timeMs) + '。';
+  speak(text);
+}
+
+/* =====================================================================
+ * E2 UI 渲染层
+ * ===================================================================== */
+
+function statusBadgeHtml(statusCode) {
+  return '<span class="badge ' + STATUS_CSS[statusCode] + '"><span class="dot"></span>' +
+         STATUS_LABELS[statusCode] + '</span>';
+}
+
+function render() {
+  renderZoneTabs();
+  renderZoneInfo();
+  renderRecords();
+  renderLog();
+  renderButtonStates();
+}
+
+function renderButtonStates() {
+  // 记录现场：所选 zone 有实时数据才可用（crowdLevel 取运行时值）
+  document.getElementById('btn-capture').disabled = !(state[selectedZone] && state[selectedZone].lastMsg);
+}
+
+function renderZoneTabs() {
+  const root = document.getElementById('zone-tabs');
+  root.innerHTML = VALID_ZONES.map(zoneId =>
+    '<button class="zc-' + zoneId + (zoneId === selectedZone ? ' active' : '') +
+    '" onclick="selectZone(\'' + zoneId + '\')">' + zoneId + '<br>' + ZONE_NAMES[zoneId] + '</button>'
+  ).join('');
+}
+
+function renderZoneInfo() {
+  const root = document.getElementById('zone-info');
+  const zone = state[selectedZone];
+  const msg = zone.lastMsg;
+  if (!msg) {
+    root.innerHTML = '<div class="empty">该区域暂无数据（订阅 airguard/zones/all 中）</div>';
+    return;
+  }
+  const status = computeStatus(msg.pm25, msg.co2);
+  const p = scorePriority(msg, status);
+  const ev = activeEventOf(zone);
+  let html = '<div class="stat-grid">' +
+    '<div class="stat"><div class="stat-label">PM2.5</div><div class="stat-value">' + fmt(msg.pm25) + '</div></div>' +
+    '<div class="stat"><div class="stat-label">CO₂</div><div class="stat-value">' + fmt(msg.co2) + '</div></div>' +
+    '<div class="stat"><div class="stat-label">人流等级</div><div class="stat-value">' + msg.crowdLevel + '</div></div>' +
+    '</div>';
+  html += '<div class="info-row"><span class="k">状态</span><span class="v">' + statusBadgeHtml(status) + '</span></div>';
+  html += '<div class="info-row"><span class="k">优先分数</span><span class="v">' + p.score + ' 分' +
+          (p.needReview ? '（需人工复核）' : '') + '</span></div>';
+  html += '<div class="info-row"><span class="k">判断理由</span><span class="v">' + escapeHtml(p.reason) + '</span></div>';
+  html += '<div class="info-row"><span class="k">活动事件</span><span class="v">' +
+          (ev ? '<span class="badge ' + EVENT_STATUS_CSS[ev.eventStatus] + '"><span class="dot"></span>' +
+                 EVENT_STATUS_LABELS[ev.eventStatus] + '</span> ' + escapeHtml(ev.event_id) : '无') + '</span></div>';
+  html += '<div class="info-row"><span class="k">更新时间</span><span class="v">' + fmtTime(msg.timeMs) + '</span></div>';
+  root.innerHTML = html;
+}
+
+function renderRecords() {
+  const root = document.getElementById('records');
+  if (!records.length) {
+    root.innerHTML = '<div class="empty">暂无感知记录（语音说"记录现场"或点击按钮生成）</div>';
+    return;
+  }
+  root.innerHTML = records.map(item =>
+    '<div class="record">' +
+      '<div class="r-head"><span>' + escapeHtml(item.record.imageId) + '</span>' +
+        '<span><button class="ghost" onclick="downloadJson(records[' + records.indexOf(item) + '].record)">下载JSON</button> ' +
+        (item.photoDataUrl ? '<button class="ghost" onclick="downloadPhoto(records[' + records.indexOf(item) + '].record.imageId, records[' + records.indexOf(item) + '].photoDataUrl)">下载照片</button>' : '') +
+      '</span></div>' +
+      (item.photoDataUrl ? '<img class="r-thumb" src="' + item.photoDataUrl + '" alt="现场照片">' : '') +
+      '<pre>' + escapeHtml(JSON.stringify(item.record, null, 2)) + '</pre>' +
+    '</div>'
+  ).join('');
+}
+
+function renderLog() {
+  const root = document.getElementById('log-panel');
+  root.innerHTML = backendLogs.map(l =>
+    '<div class="log-line log-' + l.type + '"><span class="log-time">' + l.time + '</span>' +
+    '[' + (LOG_TYPE_LABELS[l.type] || l.type) + '] ' + escapeHtml(l.text) + '</div>'
+  ).join('') || '<div class="empty">暂无日志…</div>';
+}
+
+/* =====================================================================
+ * MQTT 连接（候选地址回退 + 数据/控制双主题）
+ * ===================================================================== */
+
+let client = null;
+let connectAttempt = 0;
+
+function setConnState(text, cls) {
+  const badge = document.getElementById('conn-badge');
+  document.getElementById('conn-text').textContent = text;
+  badge.className = cls || '';
+}
+
+function initMqtt() { attemptConnect(0); }
+
+function attemptConnect(index) {
+  const url = MQTT_BROKER_CANDIDATES[index % MQTT_BROKER_CANDIDATES.length];
+  const attemptId = ++connectAttempt;
+  setConnState('连接中 ' + url + ' …', 'reconnecting');
+  log('info', '尝试连接 ' + url + ' …');
+  const c = mqtt.connect(url, {
+    clientId: 'airguard-e2-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 2000,
+    connectTimeout: 4000,
+    keepalive: 30,
+    path: '/mqtt'
+  });
+  let connected = false;
+  c.on('connect', () => {
+    connected = true;
+    if (attemptId !== connectAttempt) { c.end(); return; }
+    client = c;
+    setConnState('已连接 ' + url, 'connected');
+    log('info', '已连接 MQTT broker，订阅 ' + MQTT_TOPIC + ' / ' + CONTROL_TOPIC);
+    c.subscribe([MQTT_TOPIC, CONTROL_TOPIC], { qos: 0 }, (err) => {
+      if (err) log('warn', '订阅失败: ' + err.message);
+    });
+  });
+  c.on('error', (e) => {
+    if (attemptId !== connectAttempt) return;
+    if (connected) {
+      setConnState('连接错误', 'disconnected');
+      log('warn', 'MQTT错误: ' + (e && e.message ? e.message : e));
+      return;
+    }
+    log('warn', '连接 ' + url + ' 失败（' + (e && e.message ? e.message : e) + '），切换下一候选');
+    c.end(true);
+    attemptConnect(index + 1);
+  });
+  c.on('close', () => {
+    if (attemptId === connectAttempt && connected) setConnState('已断开', 'disconnected');
+  });
+  c.on('reconnect', () => { if (attemptId === connectAttempt) setConnState('重连中…', 'reconnecting'); });
+  c.on('offline', () => { if (attemptId === connectAttempt) setConnState('离线', 'disconnected'); });
+  c.on('message', (topic, payload) => {
+    if (attemptId !== connectAttempt) return;
+    if (topic === CONTROL_TOPIC) onControlReceived(payload.toString());
+    else onMessageReceived(payload.toString());
+  });
+}
+
+/* =====================================================================
+ * 启动与手动兜底按钮（ASR 不可用时的测试通道）
+ * ===================================================================== */
+
+function initApp() {
+  log('info', 'E2 多模态页面初始化完成');
+  initCapabilities();
+  initASR();
+  render();
+  initMqtt();
+  // TTS 语音列表异步加载，等 voiceschanged 后再刷新能力标签
+  if ('speechSynthesis' in window) {
+    speechSynthesis.onvoiceschanged = () => initCapabilities();
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('btn-cam').addEventListener('click', startCamera);
+  document.getElementById('btn-capture').addEventListener('click', capturePhoto);
+  document.getElementById('btn-asr').addEventListener('click', () => {
+    asrEnabled ? stopAsr() : startAsr();
+  });
+  document.getElementById('btn-speak').addEventListener('click', speakCurrentZone);
+  if (window.mqtt) {
+    initApp();
+  } else {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/mqtt@5/dist/mqtt.min.js';
+    s.onload = initApp;
+    s.onerror = () => {
+      setConnState('mqtt.js CDN 加载失败', 'disconnected');
+      log('warn', 'mqtt.js 两个公开 CDN 均加载失败，请检查网络');
+    };
+    document.head.appendChild(s);
+  }
+});
+</script>
+</body>
+</html>
